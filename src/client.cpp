@@ -40,6 +40,7 @@ struct Config {
     std::string host;           // relay host (empty = standalone)
     int  relayPort = 9000;      // relay control port
     bool help = false;
+    bool install = false;       // self-install mode
 };
 
 // ─── network helpers ───────────────────────────────────────────
@@ -357,8 +358,13 @@ bool checkPin(const std::string& query, int correctPin) {
 
 Config parseArgs(int argc, char* argv[]) {
     Config c;
-    if (argc < 3) { c.help = true; return c; }
-    if (std::string(argv[1]) != "send") { c.help = true; return c; }
+    if (argc < 2) { c.help = true; return c; }
+    std::string cmd = argv[1];
+    if (cmd == "install") {
+        c.install = true;
+        return c;
+    }
+    if (argc < 3 || cmd != "send") { c.help = true; return c; }
     c.path = argv[2];
     for (int i = 3; i < argc; i++) {
         std::string a = argv[i];
@@ -388,7 +394,10 @@ void printHelp(const char* prog) {
               << "  --host <addr>  Relay address (omit for standalone server)\n"
               << "  --port <num>   HTTP port (default: 8080)\n"
               << "  -h, --help     This help\n\n"
+              << "Install:\n"
+              << "  install    Copy snowflake to ~/.local/bin/ and add to PATH\n\n"
               << "Examples:\n"
+              << "  " << prog << " install                     # install to PATH\n"
               << "  " << prog << " send . serve                 # standalone HTTP server\n"
               << "  " << prog << " send file.mp4 serve once     # single file, melt after dl\n"
               << "  " << prog << " send /docs serve lock hide   # quiet, PIN-protected\n"
@@ -612,6 +621,51 @@ int main(int argc, char* argv[]) {
 
     auto cfg = parseArgs(argc, argv);
     if (cfg.help) { printHelp(argv[0]); return 0; }
+
+    // ── self-install ──
+    if (cfg.install) {
+        fs::path self = fs::read_symlink("/proc/self/exe");
+        std::vector<fs::path> candidates = {
+            fs::path(getenv("HOME") ? getenv("HOME") : "") / ".local" / "bin",
+            fs::path("/usr/local/bin")
+        };
+        fs::path dest;
+        for (auto& d : candidates) {
+            std::error_code ec;
+            if (fs::is_directory(d, ec)) { dest = d; break; }
+        }
+        if (dest.empty()) {
+            dest = candidates[0];
+            fs::create_directories(dest);
+        }
+        fs::path target = dest / "snowflake";
+        std::error_code ec;
+        fs::copy_file(self, target, fs::copy_options::overwrite_existing, ec);
+        if (ec) {
+            std::cerr << "  [err] install failed: " << ec.message() << "\n";
+            return 1;
+        }
+        fs::permissions(target, fs::perms::owner_all | fs::perms::group_read |
+                        fs::perms::group_exec | fs::perms::others_read |
+                        fs::perms::others_exec, ec);
+        std::cout << "  " << SNO << " installed to " << target.string() << "\n";
+
+        // Check if in PATH
+        std::string pathEnv = getenv("PATH") ? getenv("PATH") : "";
+        std::string destStr = dest.string();
+        if (pathEnv.find(destStr) == std::string::npos) {
+            std::cout << "  add to PATH: export PATH=\"" << destStr << ":$PATH\"\n";
+            auto home = getenv("HOME");
+            if (home) {
+                std::string rcFile = std::string(home) + "/.bashrc";
+                std::cout << "  or run: echo 'export PATH=\"" << destStr << ":$PATH\"' >> " << rcFile << "\n";
+            }
+        } else {
+            std::cout << "  " << destStr << " is already in PATH\n";
+        }
+        return 0;
+    }
+
     if (!cfg.serve) { printHelp(argv[0]); return 1; }
 
     fs::path servePath;

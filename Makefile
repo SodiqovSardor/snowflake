@@ -30,4 +30,7 @@ debug: $(BUILDDIR)/$(TARGET)-debug
 clean:
 	rm -rf $(BUILDDIR)
 
-.PHONY: all size perf static debug clean
+install: size
+	$(BUILDDIR)/$(TARGET) install
+
+.PHONY: all size perf static debug clean install
