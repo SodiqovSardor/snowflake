@@ -73,13 +73,20 @@ Compiled with `g++ -std=c++17 -Os -s`.
 ### Install
 
 ```bash
-# Build from source (requires g++ ≥8)
-git clone https://github.com/yourname/snowflake.git
-cd snowflake
-make size                    # 51 KB dynamic binary
-cp build/snowflake ~/.local/bin/
+**One-liner (Linux/macOS):**
 
-# Or grab a pre-built release from the releases page
+```bash
+curl -fsSL https://raw.githubusercontent.com/SodiqovSardor/snowflake/main/install.sh | bash
+```
+
+**Or build from source (requires g++ ≥8):**
+
+```bash
+git clone https://github.com/SodiqovSardor/snowflake.git
+cd snowflake
+make size
+make install
+```
 ```
 
 ### Share a file
