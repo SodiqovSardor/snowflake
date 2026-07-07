@@ -25,7 +25,7 @@ fail() { FAIL=$((FAIL+1)); echo "  ✗ $1"; }
 
 # ── helpers ─────────────────────────────────────────────────
 
-extract_pin() { sed -n 's/.*PIN: \([0-9]\{4\}\).*/\1/p' "$CLIENT_LOG" | head -1; }
+extract_pin() { sed -n 's/.*PIN[^0-9]*\([0-9]\{4\}\).*/\1/p' "$CLIENT_LOG" | head -1; }
 
 run() {
   # kill previous, start fresh snowflake in TMPDIR

@@ -28,6 +28,17 @@ extern "C" void handleSig(int) {
     g_running = 0;
 }
 
+// ─── color ─────────────────────────────────────────────────────
+
+static bool g_color = false; // enabled when stdout is a TTY
+
+static const char* c_reset() { return g_color ? "\033[0m"  : ""; }
+static const char* c_dim()   { return g_color ? "\033[2m"  : ""; }
+static const char* c_bold()  { return g_color ? "\033[1m"  : ""; }
+static const char* c_grn()   { return g_color ? "\033[32m" : ""; }
+static const char* c_yel()   { return g_color ? "\033[33m" : ""; }
+static const char* c_cyn()   { return g_color ? "\033[36m" : ""; }
+
 // ─── config ────────────────────────────────────────────────────
 
 struct Config {
@@ -541,8 +552,8 @@ void handleRequest(int fd, Config& cfg, const fs::path& servePath,
     auto req = parseReq(raw);
     if (!req.ok) return;
 
-    LOG(cfg, "  \xe2\x86\x92 " << req.method << " " << req.path);
-    if (!req.query.empty()) LOG(cfg, "?" << req.query);
+    LOG(cfg, c_dim() << "  ❯ " << c_reset() << c_grn() << req.method << c_reset() << " " << req.path);
+    if (!req.query.empty()) LOG(cfg, c_dim() << "?" << req.query << c_reset());
     if (!cfg.hide) std::cout << std::endl;
 
     if (req.method == "GET" && (req.path == "/" || req.path == "/index.html")) {
@@ -581,18 +592,21 @@ void handleRequest(int fd, Config& cfg, const fs::path& servePath,
             return;
         }
 
-        LOG(cfg, "  streaming " << fname << " (" << formatSize(fs::file_size(fpath, ec)) << ")");
         streamFile(fd, fpath, fname);
 
         if (cfg.once) {
             cfg.downloaded++;
             int need = isSingleFile ? 1 : cfg.totalFiles;
             if (cfg.downloaded >= need) {
-                LOGN(cfg, "\n  once mode: download complete, melting...");
+                LOGN(cfg, c_bold() << c_cyn() << "  ✓ " << c_reset() << fname << c_dim() << " (" << formatSize(fs::file_size(fpath, ec)) << ")" << c_reset());
+                LOGN(cfg, c_yel() << "  once mode: download complete, melting..." << c_reset());
                 g_running = 0;
             } else {
-                LOGN(cfg, "  once mode: " << cfg.downloaded << "/" << need << " served");
+                LOGN(cfg, c_dim() << "  ✓ " << c_reset() << fname << c_dim() << " (" << formatSize(fs::file_size(fpath, ec)) << ")" << c_reset()
+                          << "  " << c_yel() << "once " << cfg.downloaded << "/" << need << c_reset());
             }
+        } else {
+            LOGN(cfg, c_dim() << "  ✓ " << c_reset() << fname << c_dim() << " (" << formatSize(fs::file_size(fpath, ec)) << ")" << c_reset());
         }
     }
     else {
@@ -615,9 +629,10 @@ int runStandalone(Config& cfg, const fs::path& servePath) {
     }
 
     auto localIP = getLocalIP();
-    LOGN(cfg, "  http://127.0.0.1:" << cfg.port);
-    LOGN(cfg, "  http://localhost:" << cfg.port);
-    if (!localIP.empty()) LOGN(cfg, "  http://" << localIP << ":" << cfg.port);
+    LOGN(cfg, c_dim() << "  URLs" << c_reset());
+    LOGN(cfg, "    " << c_cyn() << "http://127.0.0.1:" << cfg.port << c_reset());
+    LOGN(cfg, "    " << c_cyn() << "http://localhost:" << cfg.port << c_reset());
+    if (!localIP.empty()) LOGN(cfg, "    " << c_cyn() << "http://" << localIP << ":" << cfg.port << c_reset());
     if (!cfg.hide) std::cout << std::endl;
 
     // non-blocking accept – signal handler sets g_running=0, loop exits
@@ -639,7 +654,7 @@ int runStandalone(Config& cfg, const fs::path& servePath) {
         close(fd);
     }
     close(srv);
-    if (cfg.once) std::cout << "  \xe2\x9d\x84 melted.\n";
+    if (cfg.once) std::cout << c_bold() << c_cyn() << "  " << SNO << " melted." << c_reset() << std::endl;
     return 0;
 }
 
@@ -657,7 +672,8 @@ int runRelay(Config& cfg, const fs::path& servePath) {
         return 1;
     }
 
-    LOGN(cfg, "  relay: " << cfg.host << ":" << cfg.relayPort << "\n");
+    LOGN(cfg, "  " << c_dim() << "relay " << c_reset() << cfg.host << ":" << cfg.relayPort);
+    LOGN(cfg, "  " << c_dim() << "open  " << c_reset() << c_cyn() << "http://localhost:8080" << c_reset());
 
     while (g_running) {
         auto raw = recvUntil(fd, "\r\n\r\n");
@@ -668,8 +684,8 @@ int runRelay(Config& cfg, const fs::path& servePath) {
         auto req = parseReq(raw);
         if (!req.ok) continue;
 
-        LOG(cfg, "  \xe2\x86\x92 " << req.method << " " << req.path);
-        if (!req.query.empty()) LOG(cfg, "?" << req.query);
+        LOG(cfg, c_dim() << "  ❯ " << c_reset() << c_grn() << req.method << c_reset() << " " << req.path);
+        if (!req.query.empty()) LOG(cfg, c_dim() << "?" << req.query << c_reset());
         if (!cfg.hide) std::cout << std::endl;
 
         if (req.method == "GET" && (req.path == "/" || req.path == "/index.html")) {
@@ -706,18 +722,21 @@ int runRelay(Config& cfg, const fs::path& servePath) {
                 sendShort(fd, 404, "404 Not Found");
                 continue;
             }
-            LOG(cfg, "  streaming " << fname << " (" << formatSize(fs::file_size(fpath, ec)) << ")");
             streamFile(fd, fpath, fname);
             if (cfg.once) {
                 cfg.downloaded++;
                 int need = isFile ? 1 : cfg.totalFiles;
                 if (cfg.downloaded >= need) {
-                    LOGN(cfg, "\n  once mode: melting...");
+                    LOGN(cfg, c_bold() << c_cyn() << "  ✓ " << c_reset() << fname << c_dim() << " (" << formatSize(fs::file_size(fpath, ec)) << ")" << c_reset());
+                    LOGN(cfg, c_yel() << "  once mode: download complete, melting..." << c_reset());
                     g_running = 0;
                     break;
                 } else {
-                    LOGN(cfg, "  once mode: " << cfg.downloaded << "/" << need << " served");
+                    LOGN(cfg, c_dim() << "  ✓ " << c_reset() << fname << c_dim() << " (" << formatSize(fs::file_size(fpath, ec)) << ")" << c_reset()
+                              << "  " << c_yel() << "once " << cfg.downloaded << "/" << need << c_reset());
                 }
+            } else {
+                LOGN(cfg, c_dim() << "  ✓ " << c_reset() << fname << c_dim() << " (" << formatSize(fs::file_size(fpath, ec)) << ")" << c_reset());
             }
         }
         else {
@@ -725,8 +744,8 @@ int runRelay(Config& cfg, const fs::path& servePath) {
         }
     }
     close(fd);
-    if (cfg.once) std::cout << "  \xe2\x9d\x84 melted.\n";
-    else LOGN(cfg, "  disconnected.");
+    if (cfg.once) std::cout << c_bold() << c_cyn() << "  " << SNO << " melted." << c_reset() << std::endl;
+    else LOGN(cfg, c_dim() << "  disconnected." << c_reset());
     return 0;
 }
 
@@ -743,6 +762,7 @@ int main(int argc, char* argv[]) {
         std::cerr << "[warn] sigaction SIGTERM failed\n";
 
     auto cfg = parseArgs(argc, argv);
+    g_color = isatty(STDOUT_FILENO) || isatty(STDERR_FILENO);
     if (cfg.version) { std::cout << "haiku\n"; return 0; }
     if (cfg.help) { printHelp(argv[0]); return 0; }
 
@@ -803,25 +823,37 @@ int main(int argc, char* argv[]) {
     if (cfg.lock) {
         cfg.pin = generatePin();
         std::cerr << "\n  " << SNO << " snowflake\n"
-                  << "  [lock] PIN: " << pinStr(cfg.pin) << std::endl << std::endl;
+                  << "  " << c_dim() << "PIN" << c_reset() << "  "
+                  << c_bold() << c_yel() << pinStr(cfg.pin) << c_reset() << std::endl << std::endl;
     }
 
     bool isFile = fs::is_regular_file(servePath);
-    LOGN(cfg, "  " << SNO << " snowflake");
-    if (isFile) LOGN(cfg, "  sharing: " << servePath.filename().string());
-    else        LOGN(cfg, "  serving: " << servePath.string());
-    if (cfg.once && !isFile) {
-        int cnt = 0;
-        for (auto& e : fs::directory_iterator(servePath)) {
-            if (e.is_regular_file()) cnt++;
+
+    LOG(cfg, c_bold() << c_cyn() << "  " << SNO << " snowflake" << c_reset()
+            << c_dim() << "  zero-dependency file sharing" << c_reset() << "\n");
+    LOGN(cfg, c_dim() << "  ───────────────────────────────────────" << c_reset());
+
+    if (isFile) LOGN(cfg, "  " << c_dim() << "share " << c_reset() << servePath.filename().string());
+    else        LOGN(cfg, "  " << c_dim() << "share " << c_reset() << servePath.string());
+
+    std::string modes;
+    if (cfg.once) {
+        if (!isFile) {
+            int cnt = 0;
+            for (auto& e : fs::directory_iterator(servePath))
+                if (e.is_regular_file()) cnt++;
+            cfg.totalFiles = cnt;
+            modes += "ephemeral (" + std::to_string(cnt) + " files)";
+        } else {
+            modes += "ephemeral";
         }
-        cfg.totalFiles = cnt;
-        LOGN(cfg, "  mode: ephemeral (" << cnt << " files)");
-    } else if (cfg.once) {
-        LOGN(cfg, "  mode: ephemeral");
     }
-    if (cfg.lock && !cfg.hide) LOGN(cfg, "  mode: locked");
-    if (!cfg.hide) LOGN(cfg, "");
+    if (cfg.lock) {
+        if (!modes.empty()) modes += std::string(c_dim()) + " · " + c_reset();
+        modes += "locked";
+    }
+    if (!modes.empty()) LOGN(cfg, "  " << c_dim() << "modes " << c_reset() << modes);
+    LOGN(cfg, "");
 
     if (cfg.host.empty()) {
         return runStandalone(cfg, servePath);
