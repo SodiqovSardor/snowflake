@@ -41,6 +41,7 @@ struct Config {
     std::string host;           // relay host (empty = standalone)
     int  relayPort = 9000;      // relay control port
     bool help = false;
+    bool version = false;
     bool install = false;       // self-install mode
 };
 
@@ -182,8 +183,7 @@ std::string urlEncode(const std::string& s) {
 }
 
 static const std::string SNO = "\xe2\x9d\x84"; // \u2744 (terminal, for non-UI)
-
-static const std::string SNO_SVG = "<svg viewBox='0 0 24 24' width='1em' height='1em' fill='none' stroke='currentColor' stroke-width='1.5' style='display:inline-block;vertical-align:-.15em'><path d='M12 2v20M3 12h18M5.64 5.64l12.72 12.72M18.36 5.64l-12.72 12.72'/></svg>";
+static const std::string VERSION = "1.0.0";
 
 static const std::string ICON_DOC = "<svg viewBox='0 0 24 24' width='1em' height='1em' fill='none' stroke='currentColor' stroke-width='1.5' style='display:inline-block;vertical-align:-.15em'><path d='M4 4a2 2 0 0 1 2-2h8l6 6v12a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V4z'/><path d='M14 2v6h6'/></svg>";
 static const std::string ICON_IMG = "<svg viewBox='0 0 24 24' width='1em' height='1em' fill='none' stroke='currentColor' stroke-width='1.5' style='display:inline-block;vertical-align:-.15em'><rect x='3' y='3' width='18' height='18' rx='2'/><circle cx='8.5' cy='8.5' r='1.5'/><path d='M21 15l-5-5L5 21'/></svg>";
@@ -442,6 +442,7 @@ Config parseArgs(int argc, char* argv[]) {
         c.install = true;
         return c;
     }
+    if (cmd == "--version" || cmd == "-v") { c.version = true; return c; }
     if (argc < 3 || cmd != "send") { c.help = true; return c; }
     c.path = argv[2];
     for (int i = 3; i < argc; i++) {
@@ -453,6 +454,7 @@ Config parseArgs(int argc, char* argv[]) {
         else if (a == "--host" && i+1 < argc) c.host = argv[++i];
         else if (a == "--port" && i+1 < argc) c.port = std::atoi(argv[++i]);
         else if (a == "-h" || a == "--help")  c.help = true;
+        else if (a == "-v" || a == "--version") c.version = true;
     }
     if (!c.serve && (c.once || c.lock || c.hide)) c.serve = true;
     return c;
@@ -471,7 +473,8 @@ void printHelp(const char* prog) {
               << "Options:\n"
               << "  --host <addr>  Relay address (omit for standalone server)\n"
               << "  --port <num>   HTTP port (default: 8080)\n"
-              << "  -h, --help     This help\n\n"
+               << "  -h, --help     This help\n"
+               << "  -v, --version  Show version\n\n"
               << "Install:\n"
               << "  install    Copy snowflake to ~/.local/bin/ and add to PATH\n\n"
               << "Examples:\n"
@@ -726,6 +729,7 @@ int main(int argc, char* argv[]) {
         std::cerr << "[warn] sigaction SIGTERM failed\n";
 
     auto cfg = parseArgs(argc, argv);
+    if (cfg.version) { std::cout << "snowflake " << VERSION << std::endl; return 0; }
     if (cfg.help) { printHelp(argv[0]); return 0; }
 
     // ── self-install ──
