@@ -9,7 +9,7 @@ VERSION="${1:-latest}"
 INSTALL_DIR="${INSTALL_DIR:-$HOME/.local/bin}"
 
 # ── help ──────────────────────────────────────────────────────
-if [ "$1" = "-h" ] || [ "$1" = "--help" ]; then
+if [ "${1:-}" = "-h" ] || [ "${1:-}" = "--help" ]; then
   echo "snowflake installer"
   echo ""
   echo "Usage: $0 [version]  (default: latest)"

@@ -18,7 +18,6 @@
 #include <unistd.h>
 #include <netdb.h>
 #include <poll.h>
-#include <poll.h>
 #include <fcntl.h>
 #include <ifaddrs.h>
 
