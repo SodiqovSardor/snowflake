@@ -114,7 +114,7 @@ echo "── group 2: send file serve (single file) ──"
 run_file hello.txt serve --port 8081 || exit 1
 
 RESP=$(curl -s http://localhost:8081/)
-echo "$RESP" | grep -q "single file" && ok "root → single file title" || fail "root → no single file title"
+echo "$RESP" | grep -q "snowflake" && ok "root → page renders" || fail "root → no snowflake text"
 echo "$RESP" | grep -q "hello.txt" && ok "root → shows filename" || fail "root → filename missing"
 
 DL=$(curl -s http://localhost:8081/download/hello.txt)

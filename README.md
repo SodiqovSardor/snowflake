@@ -6,7 +6,7 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 ![C++17](https://img.shields.io/badge/C%2B%2B-17-00599C.svg)
-![Size](https://img.shields.io/badge/binary-51%20KB-brightgreen)
+![Size](https://img.shields.io/badge/binary-55%20KB-brightgreen)
 ![Platform](https://img.shields.io/badge/platform-Linux%20|%20macOS-lightgrey)
 
 <br>
@@ -49,9 +49,9 @@ a file download completes. Perfect for one-shot sharing.
 `snowflake send ./video.mp4 serve` — serves one file.  
 `snowflake send ./docs serve` — serves a full directory listing.
 
-**🎨 Clean Dark UI**  
-Dark theme (#0d1117), monospace fonts, animated ❄ spinner,  
-pulsing green status dot. File-type SVG icons.  
+**🎨 Minimal UI with Light/Dark Mode**  
+Dark/light theme toggle, centered spinning ❄, responsive design  
+works on phone/tablet/desktop. File-type SVG icons.  
 PIN entry card when locked.
 
 **🌐 Dual Mode**  
@@ -72,11 +72,11 @@ Compiled with `g++ -std=c++17 -Os -s`.
 
 ### Install
 
-```bash
 **One-liner (Linux/macOS):**
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/SodiqovSardor/snowflake/main/install.sh | bash
+# Auto-detects arch, downloads pre-built binary. Falls back to source build.
 ```
 
 **Or build from source (requires g++ ≥8):**
@@ -87,7 +87,6 @@ cd snowflake
 make size
 make install
 ```
-```
 
 ### Share a file
 
@@ -95,7 +94,10 @@ make install
 # Terminal 1 — serve a single file, melt after one download
 snowflake send ./report.pdf serve once
 
-# Open http://192.168.1.219:8080 on your phone → download → binary exits
+# Open on your phone → binary exits after first download
+#   http://127.0.0.1:8080
+#   http://localhost:8080
+#   http://192.168.1.219:8080  ← network IP auto-detected
 ```
 
 ### Share a directory
@@ -188,9 +190,9 @@ In **relay mode** (`--host`), it connects to `relay.js` which forwards browser r
 ## ⚙️ Build Options
 
 ```bash
-make size      # 51 KB — optimized for size (default)
+make size      # 55 KB — optimized for size (default)
 make perf      # 67 KB — optimized for speed (-O3 -flto)
-make static    # ~800 KB — fully static, portable to any Linux
+make static    # ~900 KB — fully static, portable to any Linux
 make debug     # ~2 MB — debug symbols, -O0
 ```
 
@@ -202,7 +204,7 @@ Compiler: `g++ -std=c++17 -Os -s -o snowflake src/client.cpp`
 
 ```bash
 bash test.sh
-# 36 tests, 0 failures
+# 36 tests, all pass
 ```
 
 Tests cover: standalone directory serving, single file mode, once mode  
@@ -219,6 +221,7 @@ blocking, 404 handling, and CLI error cases.
 - **Zero disk writes on relay**: data streams in memory through the tunnel
 - **Zero external dependencies**: no libcurl, no OpenSSL, no npm packages
 - **SIGINT clean shutdown**: Ctrl+C terminates gracefully
+- **URL encoding**: filenames with spaces and special chars handled safely
 
 ---
 

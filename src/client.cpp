@@ -9,6 +9,7 @@
 #include <csignal>
 #include <ctime>
 #include <algorithm>
+#include <cctype>
 #include <unordered_map>
 
 #include <sys/socket.h>
@@ -19,6 +20,7 @@
 #include <poll.h>
 #include <poll.h>
 #include <fcntl.h>
+#include <ifaddrs.h>
 
 namespace fs = std::filesystem;
 
@@ -133,6 +135,49 @@ std::string htmlEscape(const std::string& raw) {
     return out;
 }
 
+std::string urlDecode(const std::string& s) {
+    std::string out;
+    out.reserve(s.size());
+    for (size_t i = 0; i < s.size(); i++) {
+        if (s[i] == '%' && i + 2 < s.size()) {
+            auto hex = [](char c) -> int {
+                if (c >= '0' && c <= '9') return c - '0';
+                if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+                if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+                return 0;
+            };
+            int hi = hex(s[i + 1]);
+            int lo = hex(s[i + 2]);
+            if (hi || lo || s[i+1] != '0') {
+                out += static_cast<char>((hi << 4) | lo);
+                i += 2;
+            } else {
+                out += '%';
+            }
+        } else if (s[i] == '+') {
+            out += ' ';
+        } else {
+            out += s[i];
+        }
+    }
+    return out;
+}
+
+std::string urlEncode(const std::string& s) {
+    std::string out;
+    out.reserve(s.size() * 3);
+    for (unsigned char c : s) {
+        if (std::isalnum(c) || c == '-' || c == '_' || c == '.' || c == '~') {
+            out += c;
+        } else {
+            char buf[4];
+            std::snprintf(buf, sizeof(buf), "%%%02X", c);
+            out += buf;
+        }
+    }
+    return out;
+}
+
 static const std::string SNO = "\xe2\x9d\x84"; // \u2744 (terminal, for non-UI)
 
 static const std::string SNO_SVG = "<svg viewBox='0 0 24 24' width='1em' height='1em' fill='none' stroke='currentColor' stroke-width='1.5' style='display:inline-block;vertical-align:-.15em'><path d='M12 2v20M3 12h18M5.64 5.64l12.72 12.72M18.36 5.64l-12.72 12.72'/></svg>";
@@ -154,6 +199,23 @@ std::string pinStr(int pin) {
     char buf[8];
     std::snprintf(buf, sizeof(buf), "%04d", pin);
     return buf;
+}
+
+std::string getLocalIP() {
+    struct ifaddrs *ifaddr, *ifa;
+    if (getifaddrs(&ifaddr) < 0) return "";
+    std::string ip;
+    for (ifa = ifaddr; ifa; ifa = ifa->ifa_next) {
+        if (!ifa->ifa_addr || ifa->ifa_addr->sa_family != AF_INET) continue;
+        auto sa = (struct sockaddr_in*)ifa->ifa_addr;
+        char addr[INET_ADDRSTRLEN];
+        inet_ntop(AF_INET, &sa->sin_addr, addr, sizeof(addr));
+        if (std::string(addr) == "127.0.0.1") continue;
+        ip = addr;
+        break;
+    }
+    freeifaddrs(ifaddr);
+    return ip;
 }
 
 // ─── file type icons ───────────────────────────────────────────
@@ -193,58 +255,72 @@ static const std::string PAGE_TOP = R"RAW(<!DOCTYPE html>
 <title>snowflake</title>
 <style>
 *{margin:0;padding:0;box-sizing:border-box}
-body{background:#0d1117;color:#c9d1d9;font-family:ui-monospace,'SF Mono','Cascadia Code','Fira Code','Consolas',monospace;padding:2rem;min-height:100vh}
-.top{display:flex;align-items:center;gap:.75rem;margin-bottom:2rem;padding-bottom:1.25rem;border-bottom:1px solid #21262d}
-.logo{display:inline-block;font-size:1.6rem;animation:spin 4s linear infinite;user-select:none}
+:root{--bg:#0d1117;--fg:#c9d1d9;--border:#30363d;--muted:#8b949e;--accent:#58a6ff;--btn-bg:#21262d;--once-bg:#3a1a1a;--once-fg:#ff7b72;--lock-bg:#1a2a3a;--lock-fg:#58a6ff}
+:root.light{--bg:#ffffff;--fg:#24292f;--border:#d0d7de;--muted:#656d76;--accent:#0969da;--btn-bg:#f3f4f6;--once-bg:#ffebe9;--once-fg:#cf222e;--lock-bg:#ddf4ff;--lock-fg:#0969da}
+body{background:var(--bg);color:var(--fg);font-family:ui-monospace,'SF Mono','Cascadia Code','Fira Code','Consolas',monospace;display:flex;flex-direction:column;align-items:center;min-height:100vh;padding:2rem}
+.hero{text-align:center;margin:3rem 0 2.5rem}
+.logo{display:inline-block;font-size:3.5rem;animation:spin 4s linear infinite;user-select:none}
 @keyframes spin{100%{transform:rotate(360deg)}}
-.title{font-size:1.3rem;color:#f0f6fc;font-weight:600;letter-spacing:-.03em}
+.badges{margin-top:.75rem;display:flex;gap:.5rem;justify-content:center}
 .badge{font-size:.65rem;padding:.15rem .55rem;border-radius:3px;text-transform:uppercase;letter-spacing:.06em}
-.badge-once{background:#3a1a1a;color:#ff7b72;border:1px solid #5c1a1a}
-.badge-lock{background:#1a2a3a;color:#58a6ff;border:1px solid #1a3a5c}
-.status{display:flex;align-items:center;gap:.45rem;margin-left:auto;font-size:.75rem;color:#8b949e}
-.dot{display:inline-block;width:8px;height:8px;border-radius:50%;background:#3fb950;animation:pulse 2s ease-in-out infinite}
-@keyframes pulse{0%,100%{opacity:1}50%{opacity:.28}}
-table{width:100%;border-collapse:collapse}
-th,td{padding:.65rem .75rem;text-align:left;border-bottom:1px solid #21262d}
-th{color:#8b949e;font-weight:400;font-size:.68rem;text-transform:uppercase;letter-spacing:.08em;border-bottom-color:#30363d}
-td{font-size:.85rem;color:#c9d1d9;word-break:break-all}
+.badge-once{background:var(--once-bg);color:var(--once-fg);border:1px solid var(--border)}
+.badge-lock{background:var(--lock-bg);color:var(--lock-fg);border:1px solid var(--border)}
+table{width:100%;border-collapse:collapse;max-width:800px}
+th,td{padding:.6rem .7rem;text-align:left;border-bottom:1px solid var(--border)}
+th{color:var(--muted);font-weight:400;font-size:.68rem;text-transform:uppercase;letter-spacing:.08em}
+td{font-size:.85rem;word-break:break-all}
 td.icon{width:2rem;font-size:1.1rem;text-align:center;word-break:normal}
-td.name{max-width:60vw}
-td.size{color:#8b949e;font-size:.8rem;white-space:nowrap;width:6rem}
+td.name{max-width:50vw}
+td.size{color:var(--muted);font-size:.8rem;white-space:nowrap;width:6rem}
 td.action{width:7rem;text-align:right;word-break:normal}
-.btn{display:inline-block;background:#21262d;color:#58a6ff;padding:.32rem .8rem;border-radius:6px;border:1px solid #30363d;font-size:.75rem;font-family:inherit;transition:background .15s,border-color .15s;cursor:pointer;text-decoration:none}
-.btn:hover{background:#1a233c;border-color:#58a6ff;text-decoration:none}
-.empty{color:#484f58;font-style:italic;padding:3rem 0;font-size:.88rem;text-align:center}
-.foot{margin-top:2rem;padding-top:1.25rem;border-top:1px solid #21262d;color:#30363d;font-size:.65rem}
-.pin-wrap{display:flex;align-items:center;justify-content:center;min-height:60vh}
-.pin-card{background:#161b22;border:1px solid #30363d;border-radius:12px;padding:2.5rem 2.8rem;max-width:400px;width:100%;text-align:center}
-.pin-card .logo{font-size:2.5rem;margin-bottom:.75rem}
-.pin-card h2{font-size:1.3rem;color:#f0f6fc;margin-bottom:.4rem}
-.pin-card p{color:#8b949e;font-size:.82rem;margin-bottom:1.5rem}
-.pin-input{background:#0d1117;border:1px solid #30363d;color:#c9d1d9;padding:.7rem;font-size:1.6rem;letter-spacing:.6em;text-align:center;width:100%;border-radius:6px;margin-bottom:1rem;font-family:inherit;outline:none;transition:border-color .2s}
-.pin-input:focus{border-color:#58a6ff}
-.pin-btn{background:#238636;color:#fff;border:none;padding:.65rem 0;width:100%;border-radius:6px;cursor:pointer;font-size:.9rem;font-family:inherit;transition:background .15s}
-.pin-btn:hover{background:#2ea043}
+.btn{display:inline-block;background:var(--btn-bg);color:var(--accent);padding:.32rem .8rem;border-radius:6px;border:1px solid var(--border);font-size:.75rem;font-family:inherit;cursor:pointer;text-decoration:none}
+.btn:hover{border-color:var(--accent)}
+.empty{color:var(--muted);font-style:italic;padding:3rem 0;font-size:.88rem;text-align:center}
+.foot{margin-top:2rem;padding-top:1rem;border-top:1px solid var(--border);color:var(--muted);font-size:.65rem;opacity:.6;text-align:center}
+.pin-wrap{display:flex;align-items:center;justify-content:center;min-height:50vh}
+.pin-card{background:var(--btn-bg);border:1px solid var(--border);border-radius:12px;padding:2.5rem 2.8rem;max-width:380px;width:100%;text-align:center}
+.pin-card .logo{font-size:2.8rem;margin-bottom:.6rem}
+.pin-card h2{font-size:1.2rem;font-weight:600;margin-bottom:.3rem}
+.pin-card p{color:var(--muted);font-size:.82rem;margin-bottom:1.5rem}
+.pin-input{background:var(--bg);border:1px solid var(--border);color:var(--fg);padding:.7rem;font-size:1.6rem;letter-spacing:.6em;text-align:center;width:100%;border-radius:6px;margin-bottom:1rem;font-family:inherit;outline:none}
+.pin-input:focus{border-color:var(--accent)}
+.pin-btn{background:var(--accent);color:#fff;border:none;padding:.65rem 0;width:100%;border-radius:6px;cursor:pointer;font-size:.9rem;font-family:inherit;font-weight:500}
+.pin-btn:hover{opacity:.9}
 .pin-err{color:#f85149;font-size:.78rem;margin-top:.75rem}
-@media(max-width:600px){body{padding:1rem}.top{flex-wrap:wrap;gap:.5rem}td,th{padding:.5rem .55rem}td.name{max-width:50vw}td.size{width:4rem;font-size:.72rem}td.action{width:5rem}.pin-card{padding:1.5rem;margin:1rem}}
+@media(max-width:900px){body{padding:1.5rem}.logo{font-size:3rem}.hero{margin:2.5rem 0 2rem}td.name{max-width:40vw}td.size{width:5rem}}
+@media(max-width:600px){body{padding:1rem}.logo{font-size:2.5rem}.hero{margin:2rem 0 1.5rem}th,td{padding:.5rem .5rem}td.name{max-width:35vw;font-size:.8rem}td.size{width:4rem;font-size:.72rem}td.action{width:5.5rem}.btn{font-size:.72rem;padding:.25rem .65rem}.pin-card{padding:2rem 1.5rem}.pin-card .logo{font-size:2.2rem}.pin-input{font-size:1.4rem;padding:.6rem}.pin-btn{padding:.55rem 0}}
+@media(max-width:420px){body{padding:.75rem}.logo{font-size:2rem}.hero{margin:1.5rem 0 1rem}table{font-size:.78rem}th,td{padding:.4rem .35rem}td.icon{width:1.5rem;font-size:1rem}td.name{max-width:30vw;font-size:.78rem}td.size{width:3rem;font-size:.65rem}td.action{width:4.5rem}.btn{font-size:.65rem;padding:.2rem .5rem}.pin-card{padding:1.5rem;margin:0 .5rem}.pin-card .logo{font-size:2rem}.pin-card h2{font-size:1.1rem}.pin-input{font-size:1.3rem;padding:.5rem;letter-spacing:.4em}.pin-btn{padding:.5rem 0;font-size:.82rem}}
 </style>
 </head>
 <body>
+<button class="theme-toggle" onclick="var r=document.documentElement;r.classList.toggle('light');localStorage.setItem('t',r.classList.contains('light')?'l':'d')"><svg class="sun" viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="5"/><path d="M12 1v2M12 21v2M4.22 4.22l1.42 1.42M18.36 18.36l1.42 1.42M1 12h2M21 12h2M4.22 19.78l1.42-1.42M18.36 5.64l1.42-1.42"/></svg><svg class="moon" viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/></svg></button>
+<style>
+.theme-toggle{position:fixed;top:1rem;right:1rem;background:var(--btn-bg);border:1px solid var(--border);border-radius:8px;width:2.2rem;height:2.2rem;cursor:pointer;display:flex;align-items:center;justify-content:center;z-index:10;color:var(--fg)}
+.theme-toggle .sun{display:block}
+.theme-toggle .moon{display:none}
+:root.light .theme-toggle .sun{display:none}
+:root.light .theme-toggle .moon{display:block}
+@media(max-width:600px){.theme-toggle{top:.75rem;right:.75rem;width:2rem;height:2rem}.theme-toggle svg{width:16px;height:16px}}
+@media(max-width:420px){.theme-toggle{top:.5rem;right:.5rem;width:1.8rem;height:1.8rem}.theme-toggle svg{width:14px;height:14px}}
+</style>
 )RAW";
 
 static const std::string PAGE_BOTTOM = R"RAW(
-<p class="foot">snowflake &mdash; zero-dependency file sharing</p>
+<p class="foot">snowflake</p>
+<script>(function(){var r=document.documentElement;if(localStorage.getItem('t')=='l')r.classList.add('light')})()</script>
 </body>
 </html>
 )RAW";
 
-std::string topBar(const std::string& title, bool onceMode, bool lockMode, const std::string& status) {
-    std::string h;
-    h += "<div class=\"top\"><span class=\"logo\">" + SNO + "</span>";
-    h += "<span class=\"title\">" + title + "</span>";
-    if (onceMode) h += "<span class=\"badge badge-once\">once</span>";
-    if (lockMode) h += "<span class=\"badge badge-lock\">lock</span>";
-    h += "<span class=\"status\"><span class=\"dot\"></span><span>" + status + "</span></span></div>\n";
+std::string heroSection(bool onceMode, bool lockMode) {
+    std::string h = "<div class=\"hero\"><span class=\"logo\">" + SNO + "</span>";
+    if (onceMode || lockMode) {
+        h += "<div class=\"badges\">";
+        if (onceMode) h += "<span class=\"badge badge-once\">once</span>";
+        if (lockMode) h += "<span class=\"badge badge-lock\">lock</span>";
+        h += "</div>";
+    }
+    h += "</div>\n";
     return h;
 }
 
@@ -261,9 +337,8 @@ std::string generatePinPage(int correctPin, const std::string& query) {
     }
     std::string p;
     p += PAGE_TOP;
-    p += topBar("snowflake", false, false, "locked");
     p += "<div class=\"pin-wrap\"><div class=\"pin-card\">";
-    p += "<span class=\"logo\">" + SNO + "</span>";
+    p += "<div class=\"hero\"><span class=\"logo\">" + SNO + "</span></div>";
     p += "<h2>snowflake</h2><p>Enter PIN to access shared files</p>";
     p += "<form method=\"get\" action=\"/\">";
     p += "<input class=\"pin-input\" type=\"text\" name=\"pin\" inputmode=\"numeric\" pattern=\"[0-9]{4}\" maxlength=\"4\" placeholder=\"\xe2\x97\x8b\xe2\x97\x8b\xe2\x97\x8b\xe2\x97\x8b\" autofocus>";
@@ -273,7 +348,7 @@ std::string generatePinPage(int correctPin, const std::string& query) {
     return p;
 }
 
-std::string fileRows(const fs::path& dir) {
+std::string fileRows(const fs::path& dir, const std::string& pinQuery) {
     std::error_code ec;
     std::string rows;
     for (const auto& e : fs::directory_iterator(dir, ec)) {
@@ -282,15 +357,15 @@ std::string fileRows(const fs::path& dir) {
         rows += "<tr><td class=\"icon\">" + fileIcon(name) + "</td>";
         rows += "<td class=\"name\">" + htmlEscape(name) + "</td>";
         rows += "<td class=\"size\">" + formatSize(e.file_size(ec)) + "</td>";
-        rows += "<td class=\"action\"><a class=\"btn\" href=\"/download/" + name + "\">Get File</a></td></tr>\n";
+        rows += "<td class=\"action\"><a class=\"btn\" href=\"/download/" + urlEncode(name) + pinQuery + "\">Get File</a></td></tr>\n";
     }
     return rows;
 }
 
-std::string generateFileListHTML(const fs::path& dir, bool onceMode, bool lockMode) {
+std::string generateFileListHTML(const fs::path& dir, bool onceMode, bool lockMode, const std::string& pinQuery) {
     std::string p;
     p += PAGE_TOP;
-    p += topBar("snowflake", onceMode, lockMode, "connected");
+    p += heroSection(onceMode, lockMode);
     std::error_code ec;
     bool hasFiles = false;
     for (const auto& e : fs::directory_iterator(dir, ec)) {
@@ -300,24 +375,24 @@ std::string generateFileListHTML(const fs::path& dir, bool onceMode, bool lockMo
         p += "<p class=\"empty\">no files in this directory</p>";
     } else {
         p += "<table><thead><tr><th></th><th>name</th><th>size</th><th></th></tr></thead><tbody>\n";
-        p += fileRows(dir);
+        p += fileRows(dir, pinQuery);
         p += "</tbody></table>\n";
     }
     p += PAGE_BOTTOM;
     return p;
 }
 
-std::string generateSingleFileHTML(const fs::path& file, bool onceMode, bool lockMode) {
+std::string generateSingleFileHTML(const fs::path& file, bool onceMode, bool lockMode, const std::string& pinQuery) {
     auto name = file.filename().string();
     auto sz = formatSize(fs::file_size(file));
     std::string p;
     p += PAGE_TOP;
-    p += topBar("snowflake \xe2\x80\x94 single file", onceMode, lockMode, "connected");
+    p += heroSection(onceMode, lockMode);
     p += "<table><thead><tr><th></th><th>name</th><th>size</th><th></th></tr></thead><tbody>\n";
     p += "<tr><td class=\"icon\">" + fileIcon(name) + "</td>";
     p += "<td class=\"name\">" + htmlEscape(name) + "</td>";
     p += "<td class=\"size\">" + sz + "</td>";
-    p += "<td class=\"action\"><a class=\"btn\" href=\"/download/" + name + "\">Get File</a></td></tr>\n";
+    p += "<td class=\"action\"><a class=\"btn\" href=\"/download/" + urlEncode(name) + pinQuery + "\">Get File</a></td></tr>\n";
     p += "</tbody></table>\n";
     p += PAGE_BOTTOM;
     return p;
@@ -454,11 +529,17 @@ void handleRequest(int fd, Config& cfg, const fs::path& servePath,
         if (cfg.lock && !checkPin(req.query, cfg.pin)) {
             send200(fd, generatePinPage(cfg.pin, req.query), "text/html; charset=utf-8");
         } else {
-            send200(fd, htmlPage, "text/html; charset=utf-8");
+            std::string page = htmlPage;
+            if (cfg.lock) {
+                std::string pinQuery = "?pin=" + pinStr(cfg.pin);
+                if (isSingleFile) page = generateSingleFileHTML(servePath, cfg.once, cfg.lock, pinQuery);
+                else              page = generateFileListHTML(servePath, cfg.once, cfg.lock, pinQuery);
+            }
+            send200(fd, page, "text/html; charset=utf-8");
         }
     }
     else if (req.method == "GET" && req.path.rfind("/download/", 0) == 0) {
-        std::string fname = req.path.substr(10);
+        std::string fname = urlDecode(req.path.substr(10));
 
         if (cfg.lock && !checkPin(req.query, cfg.pin)) {
             LOGN(cfg, "  [warn] blocked (no PIN)");
@@ -498,8 +579,8 @@ void handleRequest(int fd, Config& cfg, const fs::path& servePath,
 int runStandalone(Config& cfg, const fs::path& servePath) {
     bool isFile = fs::is_regular_file(servePath);
     std::string htmlPage;
-    if (isFile) htmlPage = generateSingleFileHTML(servePath, cfg.once, cfg.lock);
-    else        htmlPage = generateFileListHTML(servePath, cfg.once, cfg.lock);
+    if (isFile) htmlPage = generateSingleFileHTML(servePath, cfg.once, cfg.lock, "");
+    else        htmlPage = generateFileListHTML(servePath, cfg.once, cfg.lock, "");
 
     int srv = listenOn(cfg.port);
     if (srv < 0) {
@@ -507,7 +588,11 @@ int runStandalone(Config& cfg, const fs::path& servePath) {
         return 1;
     }
 
-    LOGN(cfg, "  http://0.0.0.0:" << cfg.port << "\n");
+    auto localIP = getLocalIP();
+    LOGN(cfg, "  http://127.0.0.1:" << cfg.port);
+    LOGN(cfg, "  http://localhost:" << cfg.port);
+    if (!localIP.empty()) LOGN(cfg, "  http://" << localIP << ":" << cfg.port);
+    if (!cfg.hide) std::cout << std::endl;
 
     // non-blocking accept – signal handler sets g_running=0, loop exits
     int flags = fcntl(srv, F_GETFL, 0);
@@ -537,8 +622,8 @@ int runStandalone(Config& cfg, const fs::path& servePath) {
 int runRelay(Config& cfg, const fs::path& servePath) {
     bool isFile = fs::is_regular_file(servePath);
     std::string htmlPage;
-    if (isFile) htmlPage = generateSingleFileHTML(servePath, cfg.once, cfg.lock);
-    else        htmlPage = generateFileListHTML(servePath, cfg.once, cfg.lock);
+    if (isFile) htmlPage = generateSingleFileHTML(servePath, cfg.once, cfg.lock, "");
+    else        htmlPage = generateFileListHTML(servePath, cfg.once, cfg.lock, "");
 
     int fd = connectTo(cfg.host.c_str(), cfg.relayPort);
     if (fd < 0) {
@@ -566,11 +651,17 @@ int runRelay(Config& cfg, const fs::path& servePath) {
                 auto page = generatePinPage(cfg.pin, req.query);
                 send200(fd, page, "text/html; charset=utf-8");
             } else {
-                send200(fd, htmlPage, "text/html; charset=utf-8");
+                std::string page = htmlPage;
+                if (cfg.lock) {
+                    std::string pinQuery = "?pin=" + pinStr(cfg.pin);
+                    if (isFile) page = generateSingleFileHTML(servePath, cfg.once, cfg.lock, pinQuery);
+                    else        page = generateFileListHTML(servePath, cfg.once, cfg.lock, pinQuery);
+                }
+                send200(fd, page, "text/html; charset=utf-8");
             }
         }
         else if (req.method == "GET" && req.path.rfind("/download/", 0) == 0) {
-            std::string fname = req.path.substr(10);
+            std::string fname = urlDecode(req.path.substr(10));
             if (cfg.lock && !checkPin(req.query, cfg.pin)) {
                 LOGN(cfg, "  [warn] blocked (no PIN)");
                 sendShort(fd, 403, "403 Forbidden");

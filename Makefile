@@ -25,7 +25,9 @@ $(BUILDDIR):
 
 debug: CXXFLAGS = -std=c++17 -g -O0 -Wall -Wextra -Wpedantic -DDEBUG
 debug: $(BUILDDIR)/$(TARGET)-debug
-	$(CXX) $(CXXFLAGS) -o $@ $(SRCDIR)/client.cpp
+
+$(BUILDDIR)/$(TARGET)-debug: $(SRCDIR)/client.cpp | $(BUILDDIR)
+	$(CXX) $(CXXFLAGS) -o $@ $<
 
 clean:
 	rm -rf $(BUILDDIR)
