@@ -174,7 +174,7 @@ echo "\
 run serve hide --port 8084 || exit 1
 
 LOG_SIZE=$(wc -c < "$CLIENT_LOG")
-[ "$LOG_SIZE" -le 300 ] && ok "hide → log $LOG_SIZE bytes (minimal)" || ok "hide → log $LOG_SIZE bytes"
+[ "$LOG_SIZE" -le 300 ] && ok "hide → log $LOG_SIZE bytes (minimal)" || fail "hide → log $LOG_SIZE bytes (expected ≤300)"
 
 sleep 0.5
 ROOT_HTTP=$(curl -s -o /dev/null -w "%{http_code}" http://localhost:8084/ 2>/dev/null || echo "000")

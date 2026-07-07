@@ -63,16 +63,20 @@ std::string recvUntil(int fd, const std::string& delim) {
     std::string buf;
     buf.reserve(4096);
     char tmp[4096];
+    int idle = 0;
     while (g_running) {
         struct pollfd pfd = { fd, POLLIN, 0 };
-        int ret = poll(&pfd, 1, 1000); // 1s timeout – lets signal break through
+        int ret = poll(&pfd, 1, 1000);
         if (ret <= 0) {
             if (!g_running) return buf;
+            if (++idle > 30) return buf;
             continue;
         }
+        idle = 0;
         ssize_t n = recv(fd, tmp, sizeof(tmp), 0);
         if (n <= 0) return buf;
         buf.append(tmp, static_cast<size_t>(n));
+        if (buf.size() > 65536) return buf;
         if (buf.find(delim) != std::string::npos) return buf;
     }
     return buf;
@@ -495,11 +499,23 @@ void sendShort(int fd, int code, const std::string& status) {
     sendStr(fd, "HTTP/1.1 " + status + "\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
 }
 
+std::string escapeFilename(const std::string& s) {
+    std::string out;
+    out.reserve(s.size() + 4);
+    for (char c : s) {
+        if (c == '"') out += "\\\"";
+        else if (c == '\\') out += "\\\\";
+        else if (c == '\r' || c == '\n') out += ' ';
+        else out += c;
+    }
+    return out;
+}
+
 void streamFile(int fd, const fs::path& fpath, const std::string& fname) {
     std::error_code ec;
     auto sz = fs::file_size(fpath, ec);
     sendStr(fd, "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\n"
-        "Content-Disposition: attachment; filename=\"" + fname + "\"\r\n"
+        "Content-Disposition: attachment; filename=\"" + escapeFilename(fname) + "\"\r\n"
         "Content-Length: " + std::to_string(sz) + "\r\nConnection: close\r\n\r\n");
     std::ifstream file(fpath, std::ios::binary);
     if (file.is_open()) {
@@ -768,7 +784,7 @@ int main(int argc, char* argv[]) {
 
     if (cfg.lock) {
         cfg.pin = generatePin();
-        std::cout << "\n  " << SNO << " snowflake\n"
+        std::cerr << "\n  " << SNO << " snowflake\n"
                   << "  [lock] PIN: " << pinStr(cfg.pin) << std::endl << std::endl;
     }
 
