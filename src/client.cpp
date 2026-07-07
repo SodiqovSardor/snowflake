@@ -729,7 +729,7 @@ int main(int argc, char* argv[]) {
         std::cerr << "[warn] sigaction SIGTERM failed\n";
 
     auto cfg = parseArgs(argc, argv);
-    if (cfg.version) { std::cout << "snowflake " << VERSION << std::endl; return 0; }
+    if (cfg.version) { std::cout << "each flake unique\nan ephemeral wonder\none download, then gone\n" << VERSION << "\n"; return 0; }
     if (cfg.help) { printHelp(argv[0]); return 0; }
 
     // ── self-install ──
