@@ -43,6 +43,8 @@ struct Config {
     bool help = false;
     bool version = false;
     bool install = false;       // self-install mode
+    int  downloaded = 0;        // files served so far (once mode)
+    int  totalFiles = 0;        // total files in directory (once mode)
 };
 
 // ─── network helpers ───────────────────────────────────────────
@@ -583,8 +585,14 @@ void handleRequest(int fd, Config& cfg, const fs::path& servePath,
         streamFile(fd, fpath, fname);
 
         if (cfg.once) {
-            LOGN(cfg, "\n  once mode: download complete, melting...");
-            g_running = 0;
+            cfg.downloaded++;
+            int need = isSingleFile ? 1 : cfg.totalFiles;
+            if (cfg.downloaded >= need) {
+                LOGN(cfg, "\n  once mode: download complete, melting...");
+                g_running = 0;
+            } else {
+                LOGN(cfg, "  once mode: " << cfg.downloaded << "/" << need << " served");
+            }
         }
     }
     else {
@@ -701,9 +709,15 @@ int runRelay(Config& cfg, const fs::path& servePath) {
             LOG(cfg, "  streaming " << fname << " (" << formatSize(fs::file_size(fpath, ec)) << ")");
             streamFile(fd, fpath, fname);
             if (cfg.once) {
-                LOGN(cfg, "\n  once mode: melting...");
-                g_running = 0;
-                break;
+                cfg.downloaded++;
+                int need = isFile ? 1 : cfg.totalFiles;
+                if (cfg.downloaded >= need) {
+                    LOGN(cfg, "\n  once mode: melting...");
+                    g_running = 0;
+                    break;
+                } else {
+                    LOGN(cfg, "  once mode: " << cfg.downloaded << "/" << need << " served");
+                }
             }
         }
         else {
@@ -729,7 +743,7 @@ int main(int argc, char* argv[]) {
         std::cerr << "[warn] sigaction SIGTERM failed\n";
 
     auto cfg = parseArgs(argc, argv);
-    if (cfg.version) { std::cout << "each flake unique\nan ephemeral wonder\none download, then gone\n" << VERSION << "\n"; return 0; }
+    if (cfg.version) { std::cout << "haiku\n"; return 0; }
     if (cfg.help) { printHelp(argv[0]); return 0; }
 
     // ── self-install ──
@@ -796,7 +810,16 @@ int main(int argc, char* argv[]) {
     LOGN(cfg, "  " << SNO << " snowflake");
     if (isFile) LOGN(cfg, "  sharing: " << servePath.filename().string());
     else        LOGN(cfg, "  serving: " << servePath.string());
-    if (cfg.once) LOGN(cfg, "  mode: ephemeral");
+    if (cfg.once && !isFile) {
+        int cnt = 0;
+        for (auto& e : fs::directory_iterator(servePath)) {
+            if (e.is_regular_file()) cnt++;
+        }
+        cfg.totalFiles = cnt;
+        LOGN(cfg, "  mode: ephemeral (" << cnt << " files)");
+    } else if (cfg.once) {
+        LOGN(cfg, "  mode: ephemeral");
+    }
     if (cfg.lock && !cfg.hide) LOGN(cfg, "  mode: locked");
     if (!cfg.hide) LOGN(cfg, "");
 

@@ -134,6 +134,10 @@ echo "$RESP" | grep -q 'class="badge badge-once"' && ok "root → once badge" ||
 DL=$(curl -s http://localhost:8082/download/hello.txt)
 [ "$DL" = "hello snowflake" ] && ok "dl → correct" || fail "dl → wrong content"
 
+# download remaining files to trigger melt
+curl -s http://localhost:8082/download/small.txt  > /dev/null
+curl -s http://localhost:8082/download/1k.bin     > /dev/null
+curl -s http://localhost:8082/download/64k.bin    > /dev/null
 sleep 2
 kill -0 "$CLIENT_PID" 2>/dev/null && fail "once → client alive after dl" || ok "once → client melted"
 grep -q "melted" "$CLIENT_LOG" 2>/dev/null && ok "once → melt message" || fail "once → no melt message"
@@ -202,6 +206,10 @@ echo "$RESP" | grep -q "hello.txt" && ok "files visible" || fail "files missing"
 DL=$(curl -s "http://localhost:8085/download/hello.txt?pin=$CLIENT_PIN")
 [ "$DL" = "hello snowflake" ] && ok "dl with PIN → works" || fail "dl with PIN → failed"
 
+# download remaining files to trigger melt
+curl -s "http://localhost:8085/download/small.txt?pin=$CLIENT_PIN"  > /dev/null
+curl -s "http://localhost:8085/download/1k.bin?pin=$CLIENT_PIN"     > /dev/null
+curl -s "http://localhost:8085/download/64k.bin?pin=$CLIENT_PIN"    > /dev/null
 sleep 2
 kill -0 "$CLIENT_PID" 2>/dev/null && fail "combined → alive after dl" || ok "combined → melted"
 
