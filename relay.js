@@ -19,6 +19,8 @@ const CONTROL = parseInt(process.env.CONTROL_PORT || "9000", 10);
 let clientSock = null;
 let busy = false;
 const queue = [];
+let controlLeftover = Buffer.alloc(0);
+const REQUIRE_TOKEN = process.env.RELAY_TOKEN || "";
 
 // ─── helpers ───────────────────────────────────────────────────
 
@@ -86,7 +88,8 @@ function streamResponse(clientSock, browserSock) {
     let headerEnd = -1;
     let bodyLen   = -1;
     let bodyRead  = 0;
-    let buffer    = Buffer.alloc(0);
+    let buffer    = controlLeftover.length > 0 ? controlLeftover : Buffer.alloc(0);
+    controlLeftover = Buffer.alloc(0);
     let settled   = false;
     let doneCalled = false;
 
@@ -178,31 +181,53 @@ function streamResponse(clientSock, browserSock) {
 // ─── control server – snowflake client connects here ───────────
 
 const ctl = net.createServer((sock) => {
-  if (clientSock && !clientSock.destroyed) {
-    console.log("[ctl] replacing old client");
-    clientSock.destroy();
+  function attach() {
+    sock.on("close", () => {
+      console.log("[ctl] client gone");
+      if (clientSock === sock) {
+        clientSock = null;
+        busy = false;
+      }
+      setTimeout(() => {
+        if (!clientSock && queue.length > 0) flushQueue();
+      }, 3000).unref();
+    });
+    sock.on("error", (e) => { console.error("[ctl] err:", e.message); });
+    // kick pending requests if this is the active client
+    if (queue.length > 0 && clientSock === sock) pump();
   }
-  clientSock = sock;
-  console.log(`[ctl] client ${sock.remoteAddress}:${sock.remotePort}`);
 
-  // reset busy when new client connects (clears stale state from old client)
-  busy = false;
-
-  sock.on("close", () => {
-    console.log("[ctl] client gone");
-    if (clientSock === sock) {
-      clientSock = null;
+  if (REQUIRE_TOKEN) {
+    readUntil(sock, "\n").then((line) => {
+      const text = line.toString("utf8").trim();
+      const m = text.match(/^AUTH (\S+)$/);
+      if (!m || m[1] !== REQUIRE_TOKEN) {
+        console.log("[ctl] auth failed");
+        try { sock.write("HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n"); } catch(_) {}
+        sock.destroy();
+        return;
+      }
+      const idx = line.indexOf("\n");
+      controlLeftover = line.slice(idx + 1);
+      console.log(`[ctl] client ${sock.remoteAddress}:${sock.remotePort} authed`);
+      if (clientSock && !clientSock.destroyed) {
+        console.log("[ctl] replacing old client");
+        clientSock.destroy();
+      }
+      clientSock = sock;
       busy = false;
+      attach();
+    }).catch(() => { sock.destroy(); });
+  } else {
+    if (clientSock && !clientSock.destroyed) {
+      console.log("[ctl] replacing old client");
+      clientSock.destroy();
     }
-    // defer flush – new client may connect within 3s
-    setTimeout(() => {
-      if (!clientSock && queue.length > 0) flushQueue();
-    }, 3000).unref();
-  });
-  sock.on("error", (e) => { console.error("[ctl] err:", e.message); });
-
-  // kick pending requests if this is the active client
-  if (queue.length > 0 && clientSock === sock) pump();
+    clientSock = sock;
+    console.log(`[ctl] client ${sock.remoteAddress}:${sock.remotePort}`);
+    busy = false;
+    attach();
+  }
 });
 
 // ─── public server – browsers connect here ─────────────────────

@@ -11,6 +11,11 @@
 #include <algorithm>
 #include <cctype>
 #include <unordered_map>
+#include <mutex>
+#include <thread>
+#include <atomic>
+#include <random>
+#include <chrono>
 
 #include <sys/socket.h>
 #include <netinet/in.h>
@@ -27,6 +32,14 @@ static volatile sig_atomic_t g_running = 1;
 extern "C" void handleSig(int) {
     g_running = 0;
 }
+
+// shared runtime state (thread-safe)
+static std::mutex       g_logMtx;
+static std::atomic<int> g_downloaded{0};
+static std::atomic<int> g_pinFails{0};
+static std::atomic<int> g_reqCount{0};
+static std::mutex       g_logFileMtx;
+static std::ofstream    g_logFile;
 
 // ─── color ─────────────────────────────────────────────────────
 
@@ -47,6 +60,7 @@ struct Config {
     bool once  = false;
     bool lock  = false;
     bool hide  = false;
+    bool upload = false;        // allow receiving files (POST /upload)
     int  pin   = -1;            // generated PIN
     int  port  = 8080;          // public HTTP port
     std::string host;           // relay host (empty = standalone)
@@ -54,8 +68,15 @@ struct Config {
     bool help = false;
     bool version = false;
     bool install = false;       // self-install mode
-    int  downloaded = 0;        // files served so far (once mode)
     int  totalFiles = 0;        // total files in directory (once mode)
+    int  expire = 0;            // max lifetime seconds (0 = forever)
+    int  idle   = 0;            // idle timeout seconds (0 = none)
+    std::string logFile;        // access log path
+    std::string configFile;     // config file path
+    std::string token;          // relay auth token
+    std::string tlsCert;        // TLS cert (optional)
+    std::string tlsKey;         // TLS key (optional)
+    time_t startedAt = 0;
 };
 
 // ─── network helpers ───────────────────────────────────────────
@@ -111,16 +132,19 @@ int connectTo(const char* host, int port) {
 }
 
 int listenOn(int port) {
-    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    int fd = socket(AF_INET6, SOCK_STREAM, 0);
     if (fd < 0) return -1;
     int opt = 1;
     setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
-    struct sockaddr_in addr{};
-    addr.sin_family = AF_INET;
-    addr.sin_addr.s_addr = INADDR_ANY;
-    addr.sin_port = htons(port);
+    // accept both IPv4 and IPv6 on the same socket (0 = dual-stack)
+    int v6only = 0;
+    setsockopt(fd, IPPROTO_IPV6, IPV6_V6ONLY, &v6only, sizeof(v6only));
+    struct sockaddr_in6 addr{};
+    addr.sin6_family = AF_INET6;
+    addr.sin6_addr = in6addr_any;
+    addr.sin6_port = htons(port);
     if (bind(fd, (struct sockaddr*)&addr, sizeof(addr)) < 0) { close(fd); return -1; }
-    if (listen(fd, 8) < 0) { close(fd); return -1; }
+    if (listen(fd, 16) < 0) { close(fd); return -1; }
     return fd;
 }
 
@@ -198,6 +222,34 @@ std::string urlEncode(const std::string& s) {
 static const std::string SNO = "\xe2\x9d\x84"; // \u2744 (terminal, for non-UI)
 static const std::string VERSION = "1.0.0";
 
+#include "qrcodegen.hpp"
+std::string qrSvg(const std::string& text, int quietZone = 4) {
+    using namespace qrcodegen;
+    try {
+        QrCode qr = QrCode::encodeText(text.c_str(), QrCode::Ecc::LOW);
+        int sz = qr.getSize();
+        int scale = 4;
+        int dim = sz + quietZone * 2;
+        std::ostringstream os;
+        os << "<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 " << (dim*scale) << " " << (dim*scale)
+           << "' shape-rendering='crispEdges' width='" << (dim*scale) << "' height='" << (dim*scale) << "'>";
+        os << "<rect width='100%' height='100%' fill='#ffffff'/>";
+        for (int y = 0; y < sz; y++) {
+            for (int x = 0; x < sz; x++) {
+                if (qr.getModule(x, y)) {
+                    int px = (x + quietZone) * scale;
+                    int py = (y + quietZone) * scale;
+                    os << "<rect x='" << px << "' y='" << py << "' width='" << scale << "' height='" << scale << "' fill='#000000'/>";
+                }
+            }
+        }
+        os << "</svg>";
+        return os.str();
+    } catch (...) {
+        return "";
+    }
+}
+
 static const std::string ICON_DOC = "<svg viewBox='0 0 24 24' width='1em' height='1em' fill='none' stroke='currentColor' stroke-width='1.5' style='display:inline-block;vertical-align:-.15em'><path d='M4 4a2 2 0 0 1 2-2h8l6 6v12a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V4z'/><path d='M14 2v6h6'/></svg>";
 static const std::string ICON_IMG = "<svg viewBox='0 0 24 24' width='1em' height='1em' fill='none' stroke='currentColor' stroke-width='1.5' style='display:inline-block;vertical-align:-.15em'><rect x='3' y='3' width='18' height='18' rx='2'/><circle cx='8.5' cy='8.5' r='1.5'/><path d='M21 15l-5-5L5 21'/></svg>";
 static const std::string ICON_VID = "<svg viewBox='0 0 24 24' width='1em' height='1em' fill='none' stroke='currentColor' stroke-width='1.5' style='display:inline-block;vertical-align:-.15em'><rect x='2' y='6' width='15' height='12' rx='2'/><path d='M17 10l4-2.5v9L17 14'/></svg>";
@@ -207,8 +259,10 @@ static const std::string ICON_BIN = "<svg viewBox='0 0 24 24' width='1em' height
 
 
 int generatePin() {
-    std::srand(static_cast<unsigned>(std::time(nullptr)));
-    return 1000 + (std::rand() % 9000);
+    std::random_device rd;
+    std::mt19937 gen(rd());
+    std::uniform_int_distribution<> dis(1000, 9999);
+    return dis(gen);
 }
 
 std::string pinStr(int pin) {
@@ -232,6 +286,50 @@ std::string getLocalIP() {
     }
     freeifaddrs(ifaddr);
     return ip;
+}
+
+// ─── security / helpers ────────────────────────────────────────
+
+// true if `target` resolves to a path inside `base` (blocks symlink escapes)
+bool isWithin(const fs::path& base, const fs::path& target) {
+    std::error_code ec;
+    fs::path b = fs::weakly_canonical(base, ec);
+    if (ec) b = fs::absolute(base);
+    fs::path t = fs::weakly_canonical(target, ec);
+    if (ec) return false;
+    auto rel = fs::relative(t, b, ec);
+    if (ec) return false;
+    if (rel.empty()) return true;
+    return !rel.is_absolute() && rel.string().find("..") == std::string::npos;
+}
+
+bool pinBlocked() { return g_pinFails.load() >= 20; }
+
+void accessLog(const std::string& method, const std::string& path, int status) {
+    if (!g_logFile.is_open()) return;
+    auto now = std::chrono::system_clock::now();
+    std::time_t t = std::chrono::system_clock::to_time_t(now);
+    char ts[32];
+    std::strftime(ts, sizeof(ts), "%Y-%m-%d %H:%M:%S", std::localtime(&t));
+    std::lock_guard<std::mutex> l(g_logFileMtx);
+    g_logFile << ts << "  " << method << " " << path << "  " << status << "\n";
+    g_logFile.flush();
+}
+
+// parse "Range: bytes=START-END" → {ok, start, count}. count=0 means "to end"
+bool parseRange(const std::string& hdr, uint64_t fileSize, uint64_t& start, uint64_t& count) {
+    if (hdr.rfind("bytes=", 0) != 0) return false;
+    std::string r = hdr.substr(6);
+    auto dash = r.find('-');
+    if (dash == std::string::npos) return false;
+    std::string a = r.substr(0, dash);
+    std::string b = r.substr(dash + 1);
+    uint64_t s = a.empty() ? 0 : std::strtoull(a.c_str(), nullptr, 10);
+    uint64_t e = b.empty() ? (fileSize - 1) : std::strtoull(b.c_str(), nullptr, 10);
+    if (s > e || s >= fileSize) return false;
+    start = s;
+    count = (e >= fileSize) ? (fileSize - s) : (e - s + 1);
+    return true;
 }
 
 // ─── file type icons ───────────────────────────────────────────
@@ -306,6 +404,16 @@ td.action{width:7rem;text-align:right;word-break:normal}
 @media(max-width:900px){body{padding:1.5rem}.logo{font-size:3rem}.hero{margin:2.5rem 0 2rem}td.name{max-width:40vw}td.size{width:5rem}}
 @media(max-width:600px){body{padding:1rem}.logo{font-size:2.5rem}.hero{margin:2rem 0 1.5rem}th,td{padding:.5rem .5rem}td.name{max-width:35vw;font-size:.8rem}td.size{width:4rem;font-size:.72rem}td.action{width:5.5rem}.btn{font-size:.72rem;padding:.25rem .65rem}.pin-card{padding:2rem 1.5rem}.pin-card .logo{font-size:2.2rem}.pin-input{font-size:1.4rem;padding:.6rem}.pin-btn{padding:.55rem 0}}
 @media(max-width:420px){body{padding:.75rem}.logo{font-size:2rem}.hero{margin:1.5rem 0 1rem}table{font-size:.78rem}th,td{padding:.4rem .35rem}td.icon{width:1.5rem;font-size:1rem}td.name{max-width:30vw;font-size:.78rem}td.size{width:3rem;font-size:.65rem}td.action{width:4.5rem}.btn{font-size:.65rem;padding:.2rem .5rem}.pin-card{padding:1.5rem;margin:0 .5rem}.pin-card .logo{font-size:2rem}.pin-card h2{font-size:1.1rem}.pin-input{font-size:1.3rem;padding:.5rem;letter-spacing:.4em}.pin-btn{padding:.5rem 0;font-size:.82rem}}
+.upload{margin:1.8rem 0;max-width:800px;width:100%;text-align:center}
+.upload label{display:inline-block;background:var(--btn-bg);border:1px solid var(--border);color:var(--accent);padding:.55rem 1.1rem;border-radius:6px;cursor:pointer;font-size:.8rem;font-family:inherit}
+.upload label:hover{border-color:var(--accent)}
+.upload input[type=file]{display:none}
+.upload .hint{display:block;margin-top:.6rem;color:var(--muted);font-size:.7rem}
+.qr{margin-top:1.6rem;display:flex;flex-direction:column;align-items:center;gap:.4rem}
+.qr svg{background:#fff;padding:10px;border-radius:10px;width:160px;height:160px}
+.qr .qr-cap{color:var(--muted);font-size:.7rem}
+.bar{display:none;max-width:800px;width:100%;height:6px;background:var(--btn-bg);border-radius:4px;margin:1.2rem 0;overflow:hidden}
+.fill{height:100%;width:0;background:var(--accent);transition:width .12s linear}
 </style>
 </head>
 <body>
@@ -324,6 +432,14 @@ td.action{width:7rem;text-align:right;word-break:normal}
 static const std::string PAGE_BOTTOM = R"RAW(
 <p class="foot">snowflake</p>
 <script>(function(){var r=document.documentElement;if(localStorage.getItem('t')=='l')r.classList.add('light')})()</script>
+<script>
+function dl(btn){var url=btn.href;var bar=document.getElementById('bar');var fill=document.getElementById('fill');if(bar)bar.style.display='block';
+fetch(url).then(function(r){var total=+r.headers.get('Content-Length');var reader=r.body.getReader();var rec=0;var chunks=[];
+function pump(){return reader.read().then(function(res){if(res.done){var blob=new Blob(chunks);var a=document.createElement('a');a.href=URL.createObjectURL(blob);var nm=url.split('/').pop().split('?')[0];a.download=decodeURIComponent(nm);a.click();if(bar)bar.style.display='none';if(fill)fill.style.width='0%';return;}chunks.push(res.value);rec+=res.value.length;if(total&&fill)fill.style.width=(100*rec/total).toFixed(1)+'%';return pump();});}
+return pump();});return false;}
+function up(input){var f=input.files[0];if(!f)return;var url='/upload?name='+encodeURIComponent(f.name);var bar=document.getElementById('bar');var fill=document.getElementById('fill');if(bar)bar.style.display='block';
+fetch(url,{method:'POST',body:f}).then(function(r){if(bar)bar.style.display='none';if(fill)fill.style.width='0%';if(r.ok){location.reload();}else{alert('upload failed: '+r.status);}});}
+</script>
 </body>
 </html>
 )RAW";
@@ -373,12 +489,27 @@ std::string fileRows(const fs::path& dir, const std::string& pinQuery) {
         rows += "<tr><td class=\"icon\">" + fileIcon(name) + "</td>";
         rows += "<td class=\"name\">" + htmlEscape(name) + "</td>";
         rows += "<td class=\"size\">" + formatSize(e.file_size(ec)) + "</td>";
-        rows += "<td class=\"action\"><a class=\"btn\" href=\"/download/" + urlEncode(name) + pinQuery + "\">Get File</a></td></tr>\n";
+        rows += "<td class=\"action\"><a class=\"btn\" href=\"/download/" + urlEncode(name) + pinQuery + "\" onclick=\"return dl(this)\">Get File</a></td></tr>\n";
     }
     return rows;
 }
 
-std::string generateFileListHTML(const fs::path& dir, bool onceMode, bool lockMode, const std::string& pinQuery) {
+std::string uploadSection() {
+    return "<div class=\"upload\"><label for=\"up\">⬆ Upload a file</label>"
+           "<input id=\"up\" type=\"file\" onchange=\"up(this)\">"
+           "<span class=\"hint\">sent to this share via POST /upload</span></div>";
+}
+
+std::string qrSection(const std::string& url) {
+    if (url.empty()) return "";
+    std::string svg = qrSvg(url);
+    if (svg.empty()) return "";
+    return "<div class=\"qr\">" + svg + "<span class=\"qr-cap\">scan to open</span></div>";
+}
+
+std::string generateFileListHTML(const fs::path& dir, bool onceMode, bool lockMode,
+                                 const std::string& pinQuery, bool allowUpload,
+                                 const std::string& shareURL) {
     std::string p;
     p += PAGE_TOP;
     p += heroSection(onceMode, lockMode);
@@ -387,18 +518,23 @@ std::string generateFileListHTML(const fs::path& dir, bool onceMode, bool lockMo
     for (const auto& e : fs::directory_iterator(dir, ec)) {
         if (e.is_regular_file(ec)) { hasFiles = true; break; }
     }
-    if (!hasFiles) {
+    if (!hasFiles && !allowUpload) {
         p += "<p class=\"empty\">no files in this directory</p>";
     } else {
         p += "<table><thead><tr><th></th><th>name</th><th>size</th><th></th></tr></thead><tbody>\n";
         p += fileRows(dir, pinQuery);
         p += "</tbody></table>\n";
     }
+    if (allowUpload) p += uploadSection();
+    p += qrSection(shareURL);
+    p += "<div class=\"bar\" id=\"bar\"><div class=\"fill\" id=\"fill\"></div></div>";
     p += PAGE_BOTTOM;
     return p;
 }
 
-std::string generateSingleFileHTML(const fs::path& file, bool onceMode, bool lockMode, const std::string& pinQuery) {
+std::string generateSingleFileHTML(const fs::path& file, bool onceMode, bool lockMode,
+                                   const std::string& pinQuery, bool allowUpload,
+                                   const std::string& shareURL) {
     auto name = file.filename().string();
     auto sz = formatSize(fs::file_size(file));
     std::string p;
@@ -408,8 +544,11 @@ std::string generateSingleFileHTML(const fs::path& file, bool onceMode, bool loc
     p += "<tr><td class=\"icon\">" + fileIcon(name) + "</td>";
     p += "<td class=\"name\">" + htmlEscape(name) + "</td>";
     p += "<td class=\"size\">" + sz + "</td>";
-    p += "<td class=\"action\"><a class=\"btn\" href=\"/download/" + urlEncode(name) + pinQuery + "\">Get File</a></td></tr>\n";
+    p += "<td class=\"action\"><a class=\"btn\" href=\"/download/" + urlEncode(name) + pinQuery + "\" onclick=\"return dl(this)\">Get File</a></td></tr>\n";
     p += "</tbody></table>\n";
+    if (allowUpload) p += uploadSection();
+    p += qrSection(shareURL);
+    p += "<div class=\"bar\" id=\"bar\"><div class=\"fill\" id=\"fill\"></div></div>";
     p += PAGE_BOTTOM;
     return p;
 }
@@ -436,13 +575,52 @@ Request parseReq(const std::string& raw) {
     return r;
 }
 
+std::string getHeader(const std::string& head, const std::string& name) {
+    std::string needle = name;
+    std::transform(needle.begin(), needle.end(), needle.begin(), ::tolower);
+    size_t pos = 0;
+    while (pos < head.size()) {
+        size_t nl = head.find("\r\n", pos);
+        std::string line = head.substr(pos, nl == std::string::npos ? std::string::npos : nl - pos);
+        size_t colon = line.find(':');
+        if (colon != std::string::npos) {
+            std::string key = line.substr(0, colon);
+            std::string val = line.substr(colon + 1);
+            val.erase(0, val.find_first_not_of(" \t"));
+            std::string lk = key;
+            std::transform(lk.begin(), lk.end(), lk.begin(), ::tolower);
+            if (lk == needle) return val;
+        }
+        if (nl == std::string::npos) break;
+        pos = nl + 2;
+    }
+    return "";
+}
+
+// read exactly `len` bytes from fd (after the head has been consumed)
+std::string readBody(int fd, size_t len) {
+    std::string body;
+    body.reserve(len);
+    char tmp[4096];
+    while (body.size() < len && g_running) {
+        struct pollfd pfd = { fd, POLLIN, 0 };
+        if (poll(&pfd, 1, 1000) <= 0) { if (!g_running) break; continue; }
+        ssize_t n = recv(fd, tmp, std::min(sizeof(tmp), len - body.size()), 0);
+        if (n <= 0) break;
+        body.append(tmp, static_cast<size_t>(n));
+    }
+    return body;
+}
+
 // ─── PIN check ─────────────────────────────────────────────────
 
 bool checkPin(const std::string& query, int correctPin) {
     if (query.empty()) return false;
     auto pos = query.find("pin=");
     if (pos == std::string::npos) return false;
-    return std::atoi(query.c_str() + pos + 4) == correctPin;
+    int given = std::atoi(query.c_str() + pos + 4);
+    if (given != correctPin) { g_pinFails++; return false; }
+    return true;
 }
 
 // ─── arg parsing ───────────────────────────────────────────────
@@ -464,13 +642,60 @@ Config parseArgs(int argc, char* argv[]) {
         else if (a == "once")      c.once  = true;
         else if (a == "lock")      c.lock  = true;
         else if (a == "hide")      c.hide  = true;
+        else if (a == "upload")    c.upload = true;
         else if (a == "--host" && i+1 < argc) c.host = argv[++i];
         else if (a == "--port" && i+1 < argc) c.port = std::atoi(argv[++i]);
+        else if (a == "--relay-port" && i+1 < argc) c.relayPort = std::atoi(argv[++i]);
+        else if (a == "--token" && i+1 < argc) c.token = argv[++i];
+        else if (a == "--expire" && i+1 < argc) c.expire = std::atoi(argv[++i]);
+        else if (a == "--idle" && i+1 < argc) c.idle = std::atoi(argv[++i]);
+        else if (a == "--log" && i+1 < argc) c.logFile = argv[++i];
+        else if (a == "--config" && i+1 < argc) c.configFile = argv[++i];
+        else if (a == "--tls-cert" && i+1 < argc) c.tlsCert = argv[++i];
+        else if (a == "--tls-key" && i+1 < argc) c.tlsKey = argv[++i];
         else if (a == "-h" || a == "--help")  c.help = true;
         else if (a == "-v" || a == "--version") c.version = true;
     }
     if (!c.serve && (c.once || c.lock || c.hide)) c.serve = true;
     return c;
+}
+
+void applyExternalConfig(Config& c) {
+    // config file: simple key=value, # comments
+    if (!c.configFile.empty()) {
+        std::ifstream f(c.configFile);
+        std::string line;
+        while (std::getline(f, line)) {
+            line.erase(0, line.find_first_not_of(" \t"));
+            if (line.empty() || line[0] == '#') continue;
+            auto eq = line.find('=');
+            if (eq == std::string::npos) continue;
+            std::string k = line.substr(0, eq);
+            std::string v = line.substr(eq + 1);
+            k.erase(k.find_last_not_of(" \t") + 1);
+            v.erase(0, v.find_first_not_of(" \t"));
+            v.erase(v.find_last_not_of(" \t") + 1);
+            if (k == "port"    && c.port == 8080) c.port = std::atoi(v.c_str());
+            if (k == "host"    && c.host.empty()) c.host = v;
+            if (k == "relay-port" && c.relayPort == 9000) c.relayPort = std::atoi(v.c_str());
+            if (k == "token"   && c.token.empty()) c.token = v;
+            if (k == "expire"  && c.expire == 0) c.expire = std::atoi(v.c_str());
+            if (k == "idle"    && c.idle == 0) c.idle = std::atoi(v.c_str());
+            if (k == "log"     && c.logFile.empty()) c.logFile = v;
+            if (k == "tls-cert"&& c.tlsCert.empty()) c.tlsCert = v;
+            if (k == "tls-key" && c.tlsKey.empty()) c.tlsKey = v;
+        }
+    }
+    // env vars (same precedence as config file)
+    auto env = [](const char* n) -> std::string {
+        const char* v = std::getenv(n); return v ? v : "";
+    };
+    if (!env("SNOWFLAKE_PORT").empty()    && c.port == 8080) c.port = std::atoi(env("SNOWFLAKE_PORT").c_str());
+    if (!env("SNOWFLAKE_HOST").empty()    && c.host.empty()) c.host = env("SNOWFLAKE_HOST");
+    if (!env("SNOWFLAKE_TOKEN").empty()   && c.token.empty()) c.token = env("SNOWFLAKE_TOKEN");
+    if (!env("SNOWFLAKE_EXPIRE").empty()  && c.expire == 0) c.expire = std::atoi(env("SNOWFLAKE_EXPIRE").c_str());
+    if (!env("SNOWFLAKE_IDLE").empty()    && c.idle == 0) c.idle = std::atoi(env("SNOWFLAKE_IDLE").c_str());
+    if (!env("SNOWFLAKE_LOG").empty()     && c.logFile.empty()) c.logFile = env("SNOWFLAKE_LOG");
 }
 
 void printHelp(const char* prog) {
@@ -500,8 +725,8 @@ void printHelp(const char* prog) {
 
 // ─── log macros ────────────────────────────────────────────────
 
-#define LOG(cfg, msg)   do { if (!(cfg).hide) { std::cout << msg; } } while(0)
-#define LOGN(cfg, msg)  do { if (!(cfg).hide) { std::cout << msg << std::endl; } } while(0)
+#define LOG(cfg, msg)   do { if (!(cfg).hide) { std::lock_guard<std::mutex> _l(g_logMtx); std::cout << msg; } } while(0)
+#define LOGN(cfg, msg)  do { if (!(cfg).hide) { std::lock_guard<std::mutex> _l(g_logMtx); std::cout << msg << std::endl; } } while(0)
 
 // ─── response helpers ──────────────────────────────────────────
 
@@ -527,17 +752,32 @@ std::string escapeFilename(const std::string& s) {
     return out;
 }
 
-void streamFile(int fd, const fs::path& fpath, const std::string& fname) {
+void streamFile(int fd, const fs::path& fpath, const std::string& fname,
+                 uint64_t off = 0, uint64_t count = 0, bool isRange = false) {
     std::error_code ec;
     auto sz = fs::file_size(fpath, ec);
-    sendStr(fd, "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\n"
+    std::string status = isRange ? "206 Partial Content" : "200 OK";
+    std::string clen   = isRange ? std::to_string(count) : std::to_string(sz);
+    std::string rangeHdr = isRange
+        ? ("Content-Range: bytes " + std::to_string(off) + "-"
+           + std::to_string(off + count - 1) + "/" + std::to_string(sz) + "\r\n")
+        : "";
+    sendStr(fd, "HTTP/1.1 " + status + "\r\nContent-Type: application/octet-stream\r\n"
         "Content-Disposition: attachment; filename=\"" + escapeFilename(fname) + "\"\r\n"
-        "Content-Length: " + std::to_string(sz) + "\r\nConnection: close\r\n\r\n");
+        + rangeHdr +
+        "Content-Length: " + clen + "\r\nConnection: close\r\n\r\n");
     std::ifstream file(fpath, std::ios::binary);
     if (file.is_open()) {
+        if (off) file.seekg(static_cast<std::streamoff>(off));
+        uint64_t remaining = isRange ? count : sz;
         char buf[4096];
-        while (g_running && (file.read(buf, sizeof(buf)) || file.gcount() > 0)) {
-            sendAll(fd, buf, static_cast<size_t>(file.gcount()));
+        while (g_running && remaining > 0) {
+            uint64_t toRead = std::min<uint64_t>(sizeof(buf), remaining);
+            file.read(buf, static_cast<std::streamsize>(toRead));
+            std::streamsize got = file.gcount();
+            if (got <= 0) break;
+            sendAll(fd, buf, static_cast<size_t>(got));
+            remaining -= static_cast<uint64_t>(got);
             if (file.eof()) break;
         }
     }
@@ -545,8 +785,18 @@ void streamFile(int fd, const fs::path& fpath, const std::string& fname) {
 
 // ─── request handler ──────────────────────────────────────────
 
+std::string queryParam(const std::string& query, const std::string& key) {
+    std::string needle = key + "=";
+    size_t pos = query.find(needle);
+    if (pos == std::string::npos) return "";
+    pos += needle.size();
+    size_t end = query.find('&', pos);
+    return query.substr(pos, end == std::string::npos ? std::string::npos : end - pos);
+}
+
 void handleRequest(int fd, Config& cfg, const fs::path& servePath,
-                   bool isSingleFile, const std::string& htmlPage) {
+                   bool isSingleFile, const std::string& htmlPage,
+                   const std::string& shareURL) {
     auto raw = recvUntil(fd, "\r\n\r\n");
     if (raw.empty()) return;
     auto req = parseReq(raw);
@@ -556,61 +806,111 @@ void handleRequest(int fd, Config& cfg, const fs::path& servePath,
     if (!req.query.empty()) LOG(cfg, c_dim() << "?" << req.query << c_reset());
     if (!cfg.hide) std::cout << std::endl;
 
+    bool locked = cfg.lock && !checkPin(req.query, cfg.pin);
+    if (cfg.lock && pinBlocked()) { sendShort(fd, 429, "429 Too Many Requests"); accessLog(req.method, req.path, 429); return; }
+
     if (req.method == "GET" && (req.path == "/" || req.path == "/index.html")) {
-        if (cfg.lock && !checkPin(req.query, cfg.pin)) {
+        if (locked) {
             send200(fd, generatePinPage(cfg.pin, req.query), "text/html; charset=utf-8");
+            accessLog(req.method, req.path, 200);
         } else {
             std::string page = htmlPage;
             if (cfg.lock) {
                 std::string pinQuery = "?pin=" + pinStr(cfg.pin);
-                if (isSingleFile) page = generateSingleFileHTML(servePath, cfg.once, cfg.lock, pinQuery);
-                else              page = generateFileListHTML(servePath, cfg.once, cfg.lock, pinQuery);
+                if (isSingleFile) page = generateSingleFileHTML(servePath, cfg.once, cfg.lock, pinQuery, cfg.upload, shareURL);
+                else              page = generateFileListHTML(servePath, cfg.once, cfg.lock, pinQuery, cfg.upload, shareURL);
+            } else {
+                if (isSingleFile) page = generateSingleFileHTML(servePath, cfg.once, cfg.lock, "", cfg.upload, shareURL);
+                else              page = generateFileListHTML(servePath, cfg.once, cfg.lock, "", cfg.upload, shareURL);
             }
             send200(fd, page, "text/html; charset=utf-8");
+            accessLog(req.method, req.path, 200);
         }
     }
     else if (req.method == "GET" && req.path.rfind("/download/", 0) == 0) {
         std::string fname = urlDecode(req.path.substr(10));
 
-        if (cfg.lock && !checkPin(req.query, cfg.pin)) {
+        if (locked) {
             LOGN(cfg, "  [warn] blocked (no PIN)");
             sendShort(fd, 403, "403 Forbidden");
+            accessLog(req.method, req.path, 403);
             return;
         }
         if (fname.empty() || fname.find("..") != std::string::npos ||
             fname.find('/') != std::string::npos || fname.find('\\') != std::string::npos) {
             LOGN(cfg, "  [warn] traversal blocked: " << fname);
             sendShort(fd, 403, "403 Forbidden");
+            accessLog(req.method, req.path, 403);
             return;
         }
 
         fs::path fpath = isSingleFile ? servePath : (servePath / fname);
         std::error_code ec;
-        if (!fs::is_regular_file(fpath, ec)) {
-            LOGN(cfg, "  [warn] not found: " << fname);
+        if (!fs::is_regular_file(fpath, ec) || !isWithin(servePath, fpath)) {
+            LOGN(cfg, "  [warn] not found / blocked: " << fname);
             sendShort(fd, 404, "404 Not Found");
+            accessLog(req.method, req.path, 404);
             return;
         }
 
-        streamFile(fd, fpath, fname);
+        // range support (resume)
+        uint64_t off = 0, count = 0;
+        bool isRange = false;
+        std::string rangeHdr = getHeader(raw, "Range");
+        if (!rangeHdr.empty()) {
+            uint64_t sz = fs::file_size(fpath, ec);
+            if (parseRange(rangeHdr, sz, off, count)) isRange = true;
+        }
+
+        streamFile(fd, fpath, fname, off, count, isRange);
+        accessLog(req.method, req.path, isRange ? 206 : 200);
 
         if (cfg.once) {
-            cfg.downloaded++;
+            int prev = g_downloaded.fetch_add(1) + 1;
             int need = isSingleFile ? 1 : cfg.totalFiles;
-            if (cfg.downloaded >= need) {
+            if (prev >= need) {
                 LOGN(cfg, c_bold() << c_cyn() << "  ✓ " << c_reset() << fname << c_dim() << " (" << formatSize(fs::file_size(fpath, ec)) << ")" << c_reset());
                 LOGN(cfg, c_yel() << "  once mode: download complete, melting..." << c_reset());
                 g_running = 0;
             } else {
                 LOGN(cfg, c_dim() << "  ✓ " << c_reset() << fname << c_dim() << " (" << formatSize(fs::file_size(fpath, ec)) << ")" << c_reset()
-                          << "  " << c_yel() << "once " << cfg.downloaded << "/" << need << c_reset());
+                          << "  " << c_yel() << "once " << prev << "/" << need << c_reset());
             }
         } else {
             LOGN(cfg, c_dim() << "  ✓ " << c_reset() << fname << c_dim() << " (" << formatSize(fs::file_size(fpath, ec)) << ")" << c_reset());
         }
     }
+    else if (req.method == "POST" && req.path.rfind("/upload", 0) == 0) {
+        if (!cfg.upload) {
+            sendShort(fd, 403, "403 Forbidden");
+            accessLog(req.method, req.path, 403);
+            return;
+        }
+        std::string name = queryParam(req.query, "name");
+        if (name.empty() || name.find("..") != std::string::npos ||
+            name.find('/') != std::string::npos || name.find('\\') != std::string::npos) {
+            sendShort(fd, 400, "400 Bad Request");
+            accessLog(req.method, req.path, 400);
+            return;
+        }
+        std::string clenHdr = getHeader(raw, "Content-Length");
+        size_t clen = clenHdr.empty() ? 0 : (size_t)std::strtoull(clenHdr.c_str(), nullptr, 10);
+        if (clen == 0 || clen > (1024ULL * 1024 * 1024 * 4)) { // cap 4 GB
+            sendShort(fd, 413, "413 Payload Too Large");
+            accessLog(req.method, req.path, 413);
+            return;
+        }
+        std::string body = readBody(fd, clen);
+        fs::path dest = isSingleFile ? servePath.parent_path() / name : (servePath / name);
+        std::ofstream out(dest, std::ios::binary);
+        out.write(body.data(), (std::streamsize)body.size());
+        LOGN(cfg, c_dim() << "  ↑ " << c_reset() << "uploaded " << name << c_dim() << " (" << formatSize(body.size()) << ")" << c_reset());
+        sendShort(fd, 200, "200 OK");
+        accessLog(req.method, req.path, 200);
+    }
     else {
         sendShort(fd, 404, "404 Not Found");
+        accessLog(req.method, req.path, 404);
     }
 }
 
@@ -618,9 +918,17 @@ void handleRequest(int fd, Config& cfg, const fs::path& servePath,
 
 int runStandalone(Config& cfg, const fs::path& servePath) {
     bool isFile = fs::is_regular_file(servePath);
+    auto localIP = getLocalIP();
+    std::string shareURL = !localIP.empty()
+        ? ("http://" + localIP + ":" + std::to_string(cfg.port) + "/")
+        : ("http://localhost:" + std::to_string(cfg.port) + "/");
+
     std::string htmlPage;
-    if (isFile) htmlPage = generateSingleFileHTML(servePath, cfg.once, cfg.lock, "");
-    else        htmlPage = generateFileListHTML(servePath, cfg.once, cfg.lock, "");
+    if (isFile) htmlPage = generateSingleFileHTML(servePath, cfg.once, cfg.lock, "", cfg.upload, shareURL);
+    else        htmlPage = generateFileListHTML(servePath, cfg.once, cfg.lock, "", cfg.upload, shareURL);
+
+    if (!cfg.logFile.empty()) g_logFile.open(cfg.logFile, std::ios::app);
+    g_downloaded.store(0);
 
     int srv = listenOn(cfg.port);
     if (srv < 0) {
@@ -628,33 +936,58 @@ int runStandalone(Config& cfg, const fs::path& servePath) {
         return 1;
     }
 
-    auto localIP = getLocalIP();
     LOGN(cfg, c_dim() << "  URLs" << c_reset());
     LOGN(cfg, "    " << c_cyn() << "http://127.0.0.1:" << cfg.port << c_reset());
     LOGN(cfg, "    " << c_cyn() << "http://localhost:" << cfg.port << c_reset());
     if (!localIP.empty()) LOGN(cfg, "    " << c_cyn() << "http://" << localIP << ":" << cfg.port << c_reset());
+    if (cfg.upload) LOGN(cfg, c_dim() << "  upload enabled (POST /upload)" << c_reset());
+    if (cfg.expire > 0) LOGN(cfg, c_dim() << "  expires in " << cfg.expire << "s" << c_reset());
+    if (cfg.idle   > 0) LOGN(cfg, c_dim() << "  idle limit " << cfg.idle << "s" << c_reset());
     if (!cfg.hide) std::cout << std::endl;
 
-    // non-blocking accept – signal handler sets g_running=0, loop exits
+    // expire / idle watchdog
+    cfg.startedAt = std::time(nullptr);
+    std::atomic<time_t> lastActivity{std::time(nullptr)};
+    std::thread timer;
+    if (cfg.expire > 0 || cfg.idle > 0) {
+        timer = std::thread([&]() {
+            while (g_running) {
+                std::this_thread::sleep_for(std::chrono::seconds(1));
+                time_t now = std::time(nullptr);
+                if (cfg.expire > 0 && (now - cfg.startedAt) >= cfg.expire) {
+                    LOGN(cfg, c_yel() << "  expired after " << cfg.expire << "s, melting..." << c_reset());
+                    g_running = 0; break;
+                }
+                if (cfg.idle > 0 && (now - lastActivity.load()) >= cfg.idle) {
+                    LOGN(cfg, c_yel() << "  idle " << cfg.idle << "s, melting..." << c_reset());
+                    g_running = 0; break;
+                }
+            }
+        });
+    }
+
     int flags = fcntl(srv, F_GETFL, 0);
     if (flags >= 0) fcntl(srv, F_SETFL, flags | O_NONBLOCK);
 
+    std::vector<std::thread> workers;
     while (g_running) {
-        struct sockaddr_in cli;
+        struct sockaddr_storage cli;
         socklen_t len = sizeof(cli);
         int fd = accept(srv, (struct sockaddr*)&cli, &len);
         if (fd < 0) {
-            if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                usleep(100000); // 100ms – check g_running regularly
-                continue;
-            }
+            if (errno == EAGAIN || errno == EWOULDBLOCK) { usleep(50000); continue; }
+            if (errno == EINTR) continue;
             continue;
         }
-        handleRequest(fd, cfg, servePath, isFile, htmlPage);
-        close(fd);
+        lastActivity.store(std::time(nullptr));
+        workers.emplace_back(handleRequest, fd, std::ref(cfg),
+                             std::ref(servePath), isFile, std::ref(htmlPage),
+                             std::ref(shareURL));
     }
+    for (auto& t : workers) if (t.joinable()) t.join();
     close(srv);
-    if (cfg.once) std::cout << c_bold() << c_cyn() << "  " << SNO << " melted." << c_reset() << std::endl;
+    if (timer.joinable()) timer.join();
+    if (cfg.once && !cfg.hide) std::cout << c_bold() << c_cyn() << "  " << SNO << " melted." << c_reset() << std::endl;
     return 0;
 }
 
@@ -662,9 +995,13 @@ int runStandalone(Config& cfg, const fs::path& servePath) {
 
 int runRelay(Config& cfg, const fs::path& servePath) {
     bool isFile = fs::is_regular_file(servePath);
+    std::string shareURL = "http://" + cfg.host + ":8080/";
     std::string htmlPage;
-    if (isFile) htmlPage = generateSingleFileHTML(servePath, cfg.once, cfg.lock, "");
-    else        htmlPage = generateFileListHTML(servePath, cfg.once, cfg.lock, "");
+    if (isFile) htmlPage = generateSingleFileHTML(servePath, cfg.once, cfg.lock, "", cfg.upload, shareURL);
+    else        htmlPage = generateFileListHTML(servePath, cfg.once, cfg.lock, "", cfg.upload, shareURL);
+
+    if (!cfg.logFile.empty()) g_logFile.open(cfg.logFile, std::ios::app);
+    g_downloaded.store(0);
 
     int fd = connectTo(cfg.host.c_str(), cfg.relayPort);
     if (fd < 0) {
@@ -672,8 +1009,14 @@ int runRelay(Config& cfg, const fs::path& servePath) {
         return 1;
     }
 
+    // relay auth (relay enforces token if RELAY_TOKEN is set)
+    if (!cfg.token.empty()) {
+        sendStr(fd, "AUTH " + cfg.token + "\n");
+    }
+
     LOGN(cfg, "  " << c_dim() << "relay " << c_reset() << cfg.host << ":" << cfg.relayPort);
-    LOGN(cfg, "  " << c_dim() << "open  " << c_reset() << c_cyn() << "http://localhost:8080" << c_reset());
+    LOGN(cfg, "  " << c_dim() << "open  " << c_reset() << c_cyn() << "http://" << cfg.host << ":8080" << c_reset());
+    if (cfg.upload) LOGN(cfg, c_dim() << "  upload enabled (POST /upload)" << c_reset());
 
     while (g_running) {
         auto raw = recvUntil(fd, "\r\n\r\n");
@@ -688,59 +1031,99 @@ int runRelay(Config& cfg, const fs::path& servePath) {
         if (!req.query.empty()) LOG(cfg, c_dim() << "?" << req.query << c_reset());
         if (!cfg.hide) std::cout << std::endl;
 
+        bool locked = cfg.lock && !checkPin(req.query, cfg.pin);
+        if (cfg.lock && pinBlocked()) { sendShort(fd, 429, "429 Too Many Requests"); accessLog(req.method, req.path, 429); continue; }
+
         if (req.method == "GET" && (req.path == "/" || req.path == "/index.html")) {
-            if (cfg.lock && !checkPin(req.query, cfg.pin)) {
+            if (locked) {
                 auto page = generatePinPage(cfg.pin, req.query);
                 send200(fd, page, "text/html; charset=utf-8");
+                accessLog(req.method, req.path, 200);
             } else {
                 std::string page = htmlPage;
                 if (cfg.lock) {
                     std::string pinQuery = "?pin=" + pinStr(cfg.pin);
-                    if (isFile) page = generateSingleFileHTML(servePath, cfg.once, cfg.lock, pinQuery);
-                    else        page = generateFileListHTML(servePath, cfg.once, cfg.lock, pinQuery);
+                    if (isFile) page = generateSingleFileHTML(servePath, cfg.once, cfg.lock, pinQuery, cfg.upload, shareURL);
+                    else        page = generateFileListHTML(servePath, cfg.once, cfg.lock, pinQuery, cfg.upload, shareURL);
+                } else {
+                    if (isFile) page = generateSingleFileHTML(servePath, cfg.once, cfg.lock, "", cfg.upload, shareURL);
+                    else        page = generateFileListHTML(servePath, cfg.once, cfg.lock, "", cfg.upload, shareURL);
                 }
                 send200(fd, page, "text/html; charset=utf-8");
+                accessLog(req.method, req.path, 200);
             }
         }
         else if (req.method == "GET" && req.path.rfind("/download/", 0) == 0) {
             std::string fname = urlDecode(req.path.substr(10));
-            if (cfg.lock && !checkPin(req.query, cfg.pin)) {
+            if (locked) {
                 LOGN(cfg, "  [warn] blocked (no PIN)");
                 sendShort(fd, 403, "403 Forbidden");
+                accessLog(req.method, req.path, 403);
                 continue;
             }
             if (fname.empty() || fname.find("..") != std::string::npos ||
                 fname.find('/') != std::string::npos || fname.find('\\') != std::string::npos) {
                 LOGN(cfg, "  [warn] traversal blocked: " << fname);
                 sendShort(fd, 403, "403 Forbidden");
+                accessLog(req.method, req.path, 403);
                 continue;
             }
             fs::path fpath = isFile ? servePath : (servePath / fname);
             std::error_code ec;
-            if (!fs::is_regular_file(fpath, ec)) {
-                LOGN(cfg, "  [warn] not found: " << fname);
+            if (!fs::is_regular_file(fpath, ec) || !isWithin(servePath, fpath)) {
+                LOGN(cfg, "  [warn] not found / blocked: " << fname);
                 sendShort(fd, 404, "404 Not Found");
+                accessLog(req.method, req.path, 404);
                 continue;
             }
-            streamFile(fd, fpath, fname);
+            uint64_t off = 0, count = 0;
+            bool isRange = false;
+            std::string rangeHdr = getHeader(raw, "Range");
+            if (!rangeHdr.empty()) {
+                uint64_t sz = fs::file_size(fpath, ec);
+                if (parseRange(rangeHdr, sz, off, count)) isRange = true;
+            }
+            streamFile(fd, fpath, fname, off, count, isRange);
+            accessLog(req.method, req.path, isRange ? 206 : 200);
             if (cfg.once) {
-                cfg.downloaded++;
+                int prev = g_downloaded.fetch_add(1) + 1;
                 int need = isFile ? 1 : cfg.totalFiles;
-                if (cfg.downloaded >= need) {
+                if (prev >= need) {
                     LOGN(cfg, c_bold() << c_cyn() << "  ✓ " << c_reset() << fname << c_dim() << " (" << formatSize(fs::file_size(fpath, ec)) << ")" << c_reset());
                     LOGN(cfg, c_yel() << "  once mode: download complete, melting..." << c_reset());
                     g_running = 0;
                     break;
                 } else {
                     LOGN(cfg, c_dim() << "  ✓ " << c_reset() << fname << c_dim() << " (" << formatSize(fs::file_size(fpath, ec)) << ")" << c_reset()
-                              << "  " << c_yel() << "once " << cfg.downloaded << "/" << need << c_reset());
+                              << "  " << c_yel() << "once " << prev << "/" << need << c_reset());
                 }
             } else {
                 LOGN(cfg, c_dim() << "  ✓ " << c_reset() << fname << c_dim() << " (" << formatSize(fs::file_size(fpath, ec)) << ")" << c_reset());
             }
         }
+        else if (req.method == "POST" && req.path.rfind("/upload", 0) == 0) {
+            if (!cfg.upload) { sendShort(fd, 403, "403 Forbidden"); accessLog(req.method, req.path, 403); continue; }
+            std::string name = queryParam(req.query, "name");
+            if (name.empty() || name.find("..") != std::string::npos ||
+                name.find('/') != std::string::npos || name.find('\\') != std::string::npos) {
+                sendShort(fd, 400, "400 Bad Request"); accessLog(req.method, req.path, 400); continue;
+            }
+            std::string clenHdr = getHeader(raw, "Content-Length");
+            size_t clen = clenHdr.empty() ? 0 : (size_t)std::strtoull(clenHdr.c_str(), nullptr, 10);
+            if (clen == 0 || clen > (1024ULL * 1024 * 1024 * 4)) {
+                sendShort(fd, 413, "413 Payload Too Large"); accessLog(req.method, req.path, 413); continue;
+            }
+            std::string body = readBody(fd, clen);
+            fs::path dest = isFile ? servePath.parent_path() / name : (servePath / name);
+            std::ofstream out(dest, std::ios::binary);
+            out.write(body.data(), (std::streamsize)body.size());
+            LOGN(cfg, c_dim() << "  ↑ " << c_reset() << "uploaded " << name << c_dim() << " (" << formatSize(body.size()) << ")" << c_reset());
+            sendShort(fd, 200, "200 OK");
+            accessLog(req.method, req.path, 200);
+        }
         else {
             sendShort(fd, 404, "404 Not Found");
+            accessLog(req.method, req.path, 404);
         }
     }
     close(fd);
@@ -762,8 +1145,9 @@ int main(int argc, char* argv[]) {
         std::cerr << "[warn] sigaction SIGTERM failed\n";
 
     auto cfg = parseArgs(argc, argv);
+    applyExternalConfig(cfg);
     g_color = isatty(STDOUT_FILENO) || isatty(STDERR_FILENO);
-    if (cfg.version) { std::cout << "haiku\n"; return 0; }
+    if (cfg.version) { std::cout << "sonnet\n"; return 0; }
     if (cfg.help) { printHelp(argv[0]); return 0; }
 
     // ── self-install ──
@@ -822,9 +1206,17 @@ int main(int argc, char* argv[]) {
 
     if (cfg.lock) {
         cfg.pin = generatePin();
-        std::cerr << "\n  " << SNO << " snowflake\n"
-                  << "  " << c_dim() << "PIN" << c_reset() << "  "
-                  << c_bold() << c_yel() << pinStr(cfg.pin) << c_reset() << std::endl << std::endl;
+        if (cfg.hide) {
+            // stay silent: persist PIN to a file the user can read
+            std::string rt = getenv("XDG_RUNTIME_DIR") ? getenv("XDG_RUNTIME_DIR") : "/tmp";
+            fs::path pinPath = fs::path(rt) / ("snowflake-pin-" + std::to_string(getpid()) + ".txt");
+            std::ofstream pf(pinPath);
+            if (pf) pf << pinStr(cfg.pin) << "\n";
+        } else {
+            std::cerr << "\n  " << SNO << " snowflake\n"
+                      << "  " << c_dim() << "PIN" << c_reset() << "  "
+                      << c_bold() << c_yel() << pinStr(cfg.pin) << c_reset() << std::endl << std::endl;
+        }
     }
 
     bool isFile = fs::is_regular_file(servePath);

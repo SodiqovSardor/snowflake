@@ -16,6 +16,7 @@ cleanup() {
   fuser -k 8080/tcp 2>/dev/null || true
   fuser -k 9000/tcp 2>/dev/null || true
   rm -f "$CLIENT_LOG"
+  rm -f "${XDG_RUNTIME_DIR:-/tmp}/snowflake-pin-${CLIENT_PID:-0}.txt"
   rm -rf "$TMPDIR"
 }
 trap cleanup EXIT
@@ -25,7 +26,15 @@ fail() { FAIL=$((FAIL+1)); echo "  ✗ $1"; }
 
 # ── helpers ─────────────────────────────────────────────────
 
-extract_pin() { sed -n 's/.*PIN[^0-9]*\([0-9]\{4\}\).*/\1/p' "$CLIENT_LOG" | head -1; }
+extract_pin() {
+  local pin
+  pin=$(sed -n 's/.*PIN[^0-9]*\([0-9]\{4\}\).*/\1/p' "$CLIENT_LOG" | head -1)
+  [ -n "$pin" ] && { echo "$pin"; return; }
+  local rt="${XDG_RUNTIME_DIR:-/tmp}"
+  local pf="$rt/snowflake-pin-$CLIENT_PID.txt"
+  [ -f "$pf" ] && pin=$(head -1 "$pf") && [ -n "$pin" ] && { echo "$pin"; return; }
+  echo ""
+}
 
 run() {
   # kill previous, start fresh snowflake in TMPDIR
